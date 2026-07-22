@@ -1,0 +1,12 @@
+{
+  "name": "free-train-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "dev": "corepack pnpm --dir apps/desktop dev",
+    "build": "corepack pnpm --dir apps/desktop build",
+    "check": "corepack pnpm --dir apps/desktop check",
+    "tauri": "corepack pnpm --dir apps/desktop tauri"
+  }
+}

@@ -1,0 +1,12 @@
+/target/
+**/node_modules/
+**/.svelte-kit/
+**/build/
+**/dist/
+**/src-tauri/gen/
+*.log
+.DS_Store
+Thumbs.db
+/resources/ffmpeg/runtime/*
+!/resources/ffmpeg/runtime/.gitkeep
+

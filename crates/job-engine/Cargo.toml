@@ -1,0 +1,11 @@
+[package]
+name = "job-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+domain.workspace = true
+thiserror.workspace = true
+

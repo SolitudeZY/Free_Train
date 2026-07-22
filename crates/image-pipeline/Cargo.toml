@@ -1,0 +1,15 @@
+[package]
+name = "image-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+domain.workspace = true
+image.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rustdct.workspace = true
+thiserror.workspace = true
+
