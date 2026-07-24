@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use domain::{SourceKind, SourceStatus};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -77,6 +80,86 @@ CREATE TABLE IF NOT EXISTS candidate_images (
 CREATE INDEX IF NOT EXISTS idx_candidate_images_source ON candidate_images(source_id, video_offset_ms);
 "#;
 
+const MIGRATION_3: &str = r#"
+CREATE TABLE IF NOT EXISTS roi_profiles (
+    id TEXT PRIMARY KEY,
+    scope_kind TEXT NOT NULL,
+    scope_value TEXT NOT NULL,
+    name TEXT NOT NULL,
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    render_config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(scope_kind IN ('source_group', 'source')),
+    CHECK(width > 0 AND height > 0),
+    UNIQUE(scope_kind, scope_value, name)
+);
+CREATE INDEX IF NOT EXISTS idx_roi_profiles_scope
+ON roi_profiles(scope_kind, scope_value, name);
+"#;
+
+const MIGRATION_4: &str = r#"
+CREATE TABLE IF NOT EXISTS quality_assessments (
+    asset_key TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    candidate_id TEXT,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    aspect_ratio REAL NOT NULL,
+    sharpness REAL NOT NULL,
+    underexposed_ratio REAL NOT NULL,
+    overexposed_ratio REAL NOT NULL,
+    entropy REAL NOT NULL,
+    low_information REAL NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    perceptual_hash TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    analyzed_at TEXT NOT NULL,
+    decode_error TEXT,
+    FOREIGN KEY(source_id) REFERENCES source_assets(id) ON DELETE CASCADE,
+    FOREIGN KEY(candidate_id) REFERENCES candidate_images(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_quality_assessments_source
+ON quality_assessments(source_id, candidate_id);
+
+CREATE TABLE IF NOT EXISTS review_assets (
+    asset_key TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    candidate_id TEXT,
+    automatic_status TEXT NOT NULL DEFAULT 'keep',
+    automatic_reasons_json TEXT NOT NULL DEFAULT '[]',
+    manual_decision TEXT,
+    locked INTEGER NOT NULL DEFAULT 0,
+    similarity_group_id TEXT,
+    similarity_score REAL,
+    representative INTEGER NOT NULL DEFAULT 0,
+    locked_conflict INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    CHECK(automatic_status IN ('keep', 'suggest_exclude', 'warning', 'error')),
+    CHECK(manual_decision IS NULL OR manual_decision IN ('keep', 'exclude')),
+    FOREIGN KEY(source_id) REFERENCES source_assets(id) ON DELETE CASCADE,
+    FOREIGN KEY(candidate_id) REFERENCES candidate_images(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_review_assets_status
+ON review_assets(manual_decision, automatic_status, similarity_group_id);
+
+CREATE TABLE IF NOT EXISTS review_audit_events (
+    id TEXT PRIMARY KEY,
+    asset_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    before_json TEXT NOT NULL,
+    after_json TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(asset_key) REFERENCES review_assets(asset_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_review_audit_asset
+ON review_audit_events(asset_key, created_at);
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageProbe {
     pub sqlite_version: String,
@@ -139,6 +222,60 @@ pub struct StoredCandidateImage {
     pub height: u32,
     pub pinned: bool,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRoiProfile {
+    pub id: String,
+    pub scope_kind: String,
+    pub scope_value: String,
+    pub name: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub render_config_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredQualityAssessment {
+    pub asset_key: String,
+    pub source_id: String,
+    pub candidate_id: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub aspect_ratio: f64,
+    pub sharpness: f64,
+    pub underexposed_ratio: f64,
+    pub overexposed_ratio: f64,
+    pub entropy: f64,
+    pub low_information: f64,
+    pub content_sha256: String,
+    pub perceptual_hash: String,
+    pub algorithm_version: String,
+    pub analyzed_at: String,
+    pub decode_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredReviewAsset {
+    pub asset_key: String,
+    pub source_id: String,
+    pub candidate_id: Option<String>,
+    pub automatic_status: String,
+    pub automatic_reasons_json: String,
+    pub manual_decision: Option<String>,
+    pub locked: bool,
+    pub similarity_group_id: Option<String>,
+    pub similarity_score: Option<f64>,
+    pub representative: bool,
+    pub locked_conflict: bool,
+    pub updated_at: String,
 }
 
 pub struct ProjectStore {
@@ -262,6 +399,17 @@ impl ProjectStore {
                LIMIT ?1 OFFSET ?2"#,
         )?;
         let rows = statement.query_map(params![limit, offset], row_to_asset)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_source_ids(&self) -> Result<Vec<String>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM source_assets
+             ORDER BY source_group COLLATE NOCASE, source_identifier COLLATE NOCASE,
+                      file_name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -423,6 +571,18 @@ impl ProjectStore {
             .optional()?)
     }
 
+    pub fn get_candidate(&self, id: &str) -> Result<Option<StoredCandidateImage>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, source_id, video_offset_ms, source_frame_number, selection_method,
+                    parameters_json, image_path, thumbnail_path, width, height, pinned, created_at
+             FROM candidate_images WHERE id=?1",
+        )?;
+        Ok(statement
+            .query_row(params![id], row_to_candidate)
+            .optional()?)
+    }
+
     pub fn list_candidates(
         &self,
         source_id: &str,
@@ -443,6 +603,302 @@ impl ProjectStore {
             .query_row("SELECT COUNT(*) FROM candidate_images", [], |row| {
                 row.get(0)
             })?)
+    }
+
+    pub fn delete_candidates(
+        &self,
+        source_id: &str,
+        candidate_ids: Option<&[String]>,
+    ) -> Result<Vec<StoredCandidateImage>, StorageError> {
+        let requested = candidate_ids.map(|ids| ids.iter().collect::<HashSet<_>>());
+        let candidates = self
+            .list_candidates(source_id, 0, u32::MAX)?
+            .into_iter()
+            .filter(|candidate| {
+                requested
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&candidate.id))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for candidate in &candidates {
+            transaction.execute(
+                "DELETE FROM candidate_images WHERE id=?1 AND source_id=?2",
+                params![candidate.id, source_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(candidates)
+    }
+
+    pub fn delete_source(&self, source_id: &str) -> Result<bool, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM roi_profiles WHERE scope_kind='source' AND scope_value=?1",
+            params![source_id],
+        )?;
+        let deleted =
+            transaction.execute("DELETE FROM source_assets WHERE id=?1", params![source_id])?;
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
+
+    pub fn upsert_roi_profile(&self, profile: &StoredRoiProfile) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM roi_profiles WHERE id=?1", params![profile.id])?;
+        transaction.execute(
+            r#"INSERT INTO roi_profiles(
+                id, scope_kind, scope_value, name, x, y, width, height,
+                render_config_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(scope_kind, scope_value, name) DO UPDATE SET
+                id=excluded.id,
+                x=excluded.x,
+                y=excluded.y,
+                width=excluded.width,
+                height=excluded.height,
+                render_config_json=excluded.render_config_json,
+                updated_at=excluded.updated_at"#,
+            params![
+                profile.id,
+                profile.scope_kind,
+                profile.scope_value,
+                profile.name,
+                profile.x,
+                profile.y,
+                profile.width,
+                profile.height,
+                profile.render_config_json,
+                profile.created_at,
+                profile.updated_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_roi_profiles(
+        &self,
+        scope_kind: &str,
+        scope_value: &str,
+    ) -> Result<Vec<StoredRoiProfile>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, scope_kind, scope_value, name, x, y, width, height,
+                    render_config_json, created_at, updated_at
+             FROM roi_profiles
+             WHERE scope_kind=?1 AND scope_value=?2
+             ORDER BY name, id",
+        )?;
+        let rows = statement.query_map(params![scope_kind, scope_value], row_to_roi_profile)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_roi_profile(&self, id: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .connection()?
+            .execute("DELETE FROM roi_profiles WHERE id=?1", params![id])?
+            > 0)
+    }
+
+    pub fn reset_review_analysis(&self) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM quality_assessments", [])?;
+        transaction.execute(
+            "UPDATE review_assets SET automatic_status='keep', automatic_reasons_json='[]',
+             similarity_group_id=NULL, similarity_score=NULL, representative=0,
+             locked_conflict=0",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_quality_assessment(
+        &self,
+        assessment: &StoredQualityAssessment,
+    ) -> Result<(), StorageError> {
+        self.connection()?.execute(
+            r#"INSERT INTO quality_assessments(
+                asset_key, source_id, candidate_id, width, height, aspect_ratio,
+                sharpness, underexposed_ratio, overexposed_ratio, entropy,
+                low_information, content_sha256, perceptual_hash, algorithm_version,
+                analyzed_at, decode_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(asset_key) DO UPDATE SET
+                source_id=excluded.source_id, candidate_id=excluded.candidate_id,
+                width=excluded.width, height=excluded.height,
+                aspect_ratio=excluded.aspect_ratio, sharpness=excluded.sharpness,
+                underexposed_ratio=excluded.underexposed_ratio,
+                overexposed_ratio=excluded.overexposed_ratio, entropy=excluded.entropy,
+                low_information=excluded.low_information,
+                content_sha256=excluded.content_sha256,
+                perceptual_hash=excluded.perceptual_hash,
+                algorithm_version=excluded.algorithm_version,
+                analyzed_at=excluded.analyzed_at, decode_error=excluded.decode_error"#,
+            params![
+                assessment.asset_key,
+                assessment.source_id,
+                assessment.candidate_id,
+                assessment.width,
+                assessment.height,
+                assessment.aspect_ratio,
+                assessment.sharpness,
+                assessment.underexposed_ratio,
+                assessment.overexposed_ratio,
+                assessment.entropy,
+                assessment.low_information,
+                assessment.content_sha256,
+                assessment.perceptual_hash,
+                assessment.algorithm_version,
+                assessment.analyzed_at,
+                assessment.decode_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_review_asset(&self, asset: &StoredReviewAsset) -> Result<(), StorageError> {
+        self.connection()?.execute(
+            r#"INSERT INTO review_assets(
+                asset_key, source_id, candidate_id, automatic_status,
+                automatic_reasons_json, manual_decision, locked,
+                similarity_group_id, similarity_score, representative,
+                locked_conflict, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(asset_key) DO UPDATE SET
+                source_id=excluded.source_id, candidate_id=excluded.candidate_id,
+                automatic_status=excluded.automatic_status,
+                automatic_reasons_json=excluded.automatic_reasons_json,
+                similarity_group_id=excluded.similarity_group_id,
+                similarity_score=excluded.similarity_score,
+                representative=excluded.representative,
+                locked_conflict=excluded.locked_conflict,
+                updated_at=excluded.updated_at"#,
+            params![
+                asset.asset_key,
+                asset.source_id,
+                asset.candidate_id,
+                asset.automatic_status,
+                asset.automatic_reasons_json,
+                asset.manual_decision,
+                asset.locked,
+                asset.similarity_group_id,
+                asset.similarity_score,
+                asset.representative,
+                asset.locked_conflict,
+                asset.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_quality_assessments(&self) -> Result<Vec<StoredQualityAssessment>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT asset_key, source_id, candidate_id, width, height, aspect_ratio,
+                    sharpness, underexposed_ratio, overexposed_ratio, entropy,
+                    low_information, content_sha256, perceptual_hash, algorithm_version,
+                    analyzed_at, decode_error
+             FROM quality_assessments ORDER BY asset_key",
+        )?;
+        let rows = statement.query_map([], row_to_quality_assessment)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_review_assets(&self) -> Result<Vec<StoredReviewAsset>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT asset_key, source_id, candidate_id, automatic_status,
+                    automatic_reasons_json, manual_decision, locked,
+                    similarity_group_id, similarity_score, representative,
+                    locked_conflict, updated_at
+             FROM review_assets ORDER BY asset_key",
+        )?;
+        let rows = statement.query_map([], row_to_review_asset)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_review_asset(
+        &self,
+        asset_key: &str,
+    ) -> Result<Option<StoredReviewAsset>, StorageError> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT asset_key, source_id, candidate_id, automatic_status,
+                        automatic_reasons_json, manual_decision, locked,
+                        similarity_group_id, similarity_score, representative,
+                        locked_conflict, updated_at
+                 FROM review_assets WHERE asset_key=?1",
+                params![asset_key],
+                row_to_review_asset,
+            )
+            .optional()?)
+    }
+
+    pub fn set_review_state(
+        &self,
+        asset_key: &str,
+        manual_decision: Option<&str>,
+        locked: bool,
+        updated_at: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self.connection()?.execute(
+            "UPDATE review_assets SET manual_decision=?2, locked=?3, updated_at=?4 WHERE asset_key=?1",
+            params![asset_key, manual_decision, locked, updated_at],
+        )? > 0)
+    }
+
+    pub fn set_group_representative(
+        &self,
+        group_id: &str,
+        asset_key: &str,
+        updated_at: &str,
+    ) -> Result<bool, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let belongs = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_assets WHERE asset_key=?1 AND similarity_group_id=?2)",
+            params![asset_key, group_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !belongs {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE review_assets SET representative=CASE WHEN asset_key=?2 THEN 1 ELSE 0 END,
+             automatic_status=CASE WHEN asset_key=?2 THEN 'keep' WHEN locked=1 THEN 'warning' ELSE 'suggest_exclude' END,
+             updated_at=?3 WHERE similarity_group_id=?1",
+            params![group_id, asset_key, updated_at],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn insert_review_audit(
+        &self,
+        id: &str,
+        asset_key: &str,
+        action: &str,
+        before_json: &str,
+        after_json: &str,
+        actor: &str,
+        created_at: &str,
+    ) -> Result<(), StorageError> {
+        self.connection()?.execute(
+            "INSERT INTO review_audit_events(id, asset_key, action, before_json, after_json, actor, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, asset_key, action, before_json, after_json, actor, created_at],
+        )?;
+        Ok(())
     }
 
     pub fn counts(&self) -> Result<(u64, u64), StorageError> {
@@ -482,6 +938,16 @@ fn apply_migrations(connection: &Connection) -> Result<(), StorageError> {
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
         params![2_i64],
+    )?;
+    connection.execute_batch(MIGRATION_3)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+        params![3_i64],
+    )?;
+    connection.execute_batch(MIGRATION_4)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+        params![4_i64],
     )?;
     Ok(())
 }
@@ -557,6 +1023,60 @@ fn row_to_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCandidate
     })
 }
 
+fn row_to_roi_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRoiProfile> {
+    Ok(StoredRoiProfile {
+        id: row.get(0)?,
+        scope_kind: row.get(1)?,
+        scope_value: row.get(2)?,
+        name: row.get(3)?,
+        x: row.get(4)?,
+        y: row.get(5)?,
+        width: row.get(6)?,
+        height: row.get(7)?,
+        render_config_json: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn row_to_quality_assessment(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQualityAssessment> {
+    Ok(StoredQualityAssessment {
+        asset_key: row.get(0)?,
+        source_id: row.get(1)?,
+        candidate_id: row.get(2)?,
+        width: row.get(3)?,
+        height: row.get(4)?,
+        aspect_ratio: row.get(5)?,
+        sharpness: row.get(6)?,
+        underexposed_ratio: row.get(7)?,
+        overexposed_ratio: row.get(8)?,
+        entropy: row.get(9)?,
+        low_information: row.get(10)?,
+        content_sha256: row.get(11)?,
+        perceptual_hash: row.get(12)?,
+        algorithm_version: row.get(13)?,
+        analyzed_at: row.get(14)?,
+        decode_error: row.get(15)?,
+    })
+}
+
+fn row_to_review_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReviewAsset> {
+    Ok(StoredReviewAsset {
+        asset_key: row.get(0)?,
+        source_id: row.get(1)?,
+        candidate_id: row.get(2)?,
+        automatic_status: row.get(3)?,
+        automatic_reasons_json: row.get(4)?,
+        manual_decision: row.get(5)?,
+        locked: row.get(6)?,
+        similarity_group_id: row.get(7)?,
+        similarity_score: row.get(8)?,
+        representative: row.get(9)?,
+        locked_conflict: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
 pub fn probe_in_memory() -> Result<StorageProbe, StorageError> {
     let connection = Connection::open_in_memory()?;
     apply_migrations(&connection)?;
@@ -587,7 +1107,7 @@ mod tests {
     #[test]
     fn applies_initial_schema() {
         let probe = probe_in_memory().expect("in-memory SQLite should initialize");
-        assert_eq!(probe.schema_version, 2);
+        assert_eq!(probe.schema_version, 4);
         assert!(!probe.sqlite_version.is_empty());
     }
 

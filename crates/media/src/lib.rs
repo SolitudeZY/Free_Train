@@ -345,6 +345,20 @@ pub fn create_image_thumbnail(
     Ok(())
 }
 
+pub fn load_oriented_image(source: impl AsRef<Path>) -> Result<DynamicImage, MediaError> {
+    let source = source.as_ref();
+    let mut image = image::open(source)?;
+    if let Ok(file) = File::open(source)
+        && let Ok(exif) = Reader::new().read_from_container(&mut BufReader::new(file))
+        && let Some(orientation) = exif
+            .get_field(Tag::Orientation, In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0))
+    {
+        image = apply_orientation(image, orientation);
+    }
+    Ok(image)
+}
+
 pub fn create_video_thumbnail(
     executable: impl AsRef<Path>,
     source: impl AsRef<Path>,

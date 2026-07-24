@@ -4,22 +4,33 @@ use std::{
 };
 
 use application::{
-    CaptureResult, ChangeAnalysisResult, ComponentHealth, GroupSamplingEstimate, ImportResult,
-    M0Status, ProjectSession, ProjectSummary, SamplingConfig, SamplingEstimate,
-    SamplingExecutionResult, analyze_changes, capture_manual_frame, complete_pending_hashes,
-    create_video_selection, delete_video_selection, estimate_group_sampling, estimate_sampling,
-    execute_group_sampling, execute_sampling, import_sources as import_project_sources,
-    list_candidates as list_project_candidates, list_sources as list_project_sources,
-    list_video_selections, read_recent_project,
-    refresh_source_status as refresh_project_source_status, refresh_source_statuses,
-    relink_source as relink_project_source, video_frame_timestamps, write_recent_project,
+    CandidateDeletionResult, CaptureResult, ChangeAnalysisResult, ComponentHealth, ExportPlan,
+    ExportRequest, ExportResult, GroupSamplingEstimate, ImportResult, M0Status, ProjectSession,
+    ProjectSummary, ReviewAction, ReviewAnalysisConfig, ReviewWorkspace, RoiProfile,
+    SamplingConfig, SamplingEstimate, SamplingExecutionResult, SaveRoiProfile,
+    SourceDeletionProgress, SourceDeletionResult, TilePreview, analyze_changes,
+    capture_manual_frame, complete_pending_hashes, create_video_selection,
+    delete_candidates as delete_project_candidates,
+    delete_roi_profile as delete_project_roi_profile,
+    delete_sources_with_progress as delete_project_sources_with_progress, delete_video_selection,
+    estimate_group_sampling, estimate_sampling, execute_group_sampling, execute_sampling,
+    import_sources as import_project_sources, list_all_source_ids as list_project_source_ids,
+    list_candidates as list_project_candidates, list_effective_roi_profiles,
+    list_review_workspace as list_project_review_workspace, list_sources as list_project_sources,
+    list_video_selections, plan_export as plan_project_export, preview_source_tiles,
+    read_recent_project, refresh_source_status as refresh_project_source_status,
+    refresh_source_statuses, relink_source as relink_project_source,
+    run_export as run_project_export, run_review_analysis as run_project_review_analysis,
+    save_roi_profile as save_project_roi_profile,
+    update_review_items as update_project_review_items, video_frame_timestamps,
+    write_recent_project,
 };
 use domain::{EdgeStrategy, JobState, Roi, TileConfig};
 use image::{DynamicImage, ImageBuffer, Luma};
 use image_pipeline::{deterministic_brightness, global_ssim, perceptual_hash, plan_tiles};
 use job_engine::JobStateMachine;
 use storage::{StoredCandidateImage, StoredSourceAsset, StoredVideoSelection};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone)]
 struct AppState {
@@ -221,6 +232,13 @@ fn list_sources(
 }
 
 #[tauri::command]
+fn list_all_source_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    list_project_source_ids(session).map_err(error_text)
+}
+
+#[tauri::command]
 async fn refresh_source_status(state: State<'_, AppState>) -> Result<u64, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -321,6 +339,83 @@ fn get_candidates(
     let guard = state.session.lock().map_err(lock_error)?;
     let session = guard.as_ref().ok_or_else(no_project)?;
     list_project_candidates(session, &source_id, offset, limit).map_err(error_text)
+}
+
+#[tauri::command]
+async fn remove_candidates(
+    state: State<'_, AppState>,
+    source_id: String,
+    candidate_ids: Option<Vec<String>>,
+) -> Result<CandidateDeletionResult, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_mut().ok_or_else(no_project)?;
+        delete_project_candidates(session, &source_id, candidate_ids.as_deref()).map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn remove_sources(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_ids: Vec<String>,
+) -> Result<SourceDeletionResult, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_mut().ok_or_else(no_project)?;
+        delete_project_sources_with_progress(
+            session,
+            &source_ids,
+            |progress: SourceDeletionProgress| {
+                let _ = app.emit("source-removal-progress", progress);
+            },
+        )
+        .map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn run_review_analysis(
+    state: State<'_, AppState>,
+    config: ReviewAnalysisConfig,
+) -> Result<ReviewWorkspace, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_ref().ok_or_else(no_project)?;
+        run_project_review_analysis(session, &config).map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn get_review_workspace(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    list_project_review_workspace(session).map_err(error_text)
+}
+
+#[tauri::command]
+async fn update_review_items(
+    state: State<'_, AppState>,
+    asset_keys: Vec<String>,
+    action: ReviewAction,
+) -> Result<ReviewWorkspace, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_ref().ok_or_else(no_project)?;
+        update_project_review_items(session, &asset_keys, action).map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -448,6 +543,83 @@ async fn run_source_group_sampling(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+fn save_roi_profile(
+    state: State<'_, AppState>,
+    draft: SaveRoiProfile,
+) -> Result<RoiProfile, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    save_project_roi_profile(session, draft).map_err(error_text)
+}
+
+#[tauri::command]
+fn get_roi_profiles(
+    state: State<'_, AppState>,
+    source_id: String,
+) -> Result<Vec<RoiProfile>, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    list_effective_roi_profiles(session, &source_id).map_err(error_text)
+}
+
+#[tauri::command]
+fn delete_roi_profile(state: State<'_, AppState>, profile_id: String) -> Result<bool, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    delete_project_roi_profile(session, &profile_id).map_err(error_text)
+}
+
+#[tauri::command]
+async fn preview_tiles(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: String,
+    candidate_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<TilePreview>, String> {
+    let state = state.inner().clone();
+    let previews = tauri::async_runtime::spawn_blocking(move || {
+        let guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_ref().ok_or_else(no_project)?;
+        preview_source_tiles(session, &source_id, candidate_id.as_deref(), limit)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    for preview in &previews {
+        let path = PathBuf::from(&preview.preview_path);
+        if path.is_file() {
+            app.asset_protocol_scope()
+                .allow_file(path)
+                .map_err(error_text)?;
+        }
+    }
+    Ok(previews)
+}
+
+#[tauri::command]
+fn plan_export(state: State<'_, AppState>, request: ExportRequest) -> Result<ExportPlan, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    plan_project_export(session, &request).map_err(error_text)
+}
+
+#[tauri::command]
+async fn run_export(
+    state: State<'_, AppState>,
+    request: ExportRequest,
+) -> Result<ExportResult, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_ref().ok_or_else(no_project)?;
+        run_project_export(session, &request).map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn register_project_scope(app: &AppHandle, session: &ProjectSession) -> tauri::Result<()> {
     app.asset_protocol_scope()
         .allow_directory(session.project_dir().join("cache"), true)?;
@@ -515,6 +687,7 @@ pub fn run() {
             get_recent_project,
             import_sources,
             list_sources,
+            list_all_source_ids,
             refresh_source_status,
             check_source_status,
             relink_source,
@@ -523,12 +696,23 @@ pub fn run() {
             add_video_selection,
             remove_video_selection,
             get_candidates,
+            remove_candidates,
+            remove_sources,
+            run_review_analysis,
+            get_review_workspace,
+            update_review_items,
             capture_video_frame,
             estimate_video_sampling,
             run_video_sampling,
             analyze_video_changes,
             estimate_source_group_sampling,
             run_source_group_sampling,
+            save_roi_profile,
+            get_roi_profiles,
+            delete_roi_profile,
+            preview_tiles,
+            plan_export,
+            run_export,
         ])
         .run(tauri::generate_context!())
         .expect("Free-Train desktop application failed to start");
