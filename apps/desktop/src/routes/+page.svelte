@@ -156,6 +156,7 @@
   };
   type ExportResult = { exportId: string; written: number; skipped: number; manifestPath: string; failures: { path: string; error: string }[] };
   type SimilarityScope = "source" | "source_group" | "project";
+  type QualityMetricKey = "sharpness" | "low_information" | "underexposed" | "overexposed" | "resolution";
   type ReviewAction = "keep" | "exclude" | "restore" | "lock" | "unlock" | "make_representative";
   type QualityMetrics = {
     width: number; height: number; aspectRatio: number; sharpness: number;
@@ -294,6 +295,8 @@
   let reviewSsimThreshold = $state(94);
   let reviewSimilarityScope = $state<SimilarityScope>("source");
   let reviewTimeWindowSeconds = $state(30);
+  let reviewQualityMetric = $state<QualityMetricKey>("sharpness");
+  let reviewSort = $state("source");
   let roiDrag = $state<{
     mode: "create" | "move";
     startX: number;
@@ -349,8 +352,30 @@
     return (reviewStatusFilter === "all" || status === reviewStatusFilter)
       && (reviewSourceFilter === "all" || item.sourceIdentifier === reviewSourceFilter)
       && (reviewGroupFilter === "all" || item.similarityGroupId === reviewGroupFilter);
-  }));
+  }).sort((left, right) => reviewSortItems(left, right)));
   const visibleReviewItems = $derived(filteredReviewItems.slice(0, reviewVisibleLimit));
+  const reviewMetricValues = $derived((reviewWorkspace?.items ?? []).map((item) => reviewMetricValue(item, reviewQualityMetric)).filter((value): value is number => value !== null));
+  const reviewMetricRange = $derived.by(() => {
+    const values = reviewMetricValues;
+    if (!values.length) return { min: 0, max: 1 };
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    return { min, max: max === min ? min + 1 : max };
+  });
+  const reviewHistogram = $derived.by(() => {
+    const buckets = Array.from({ length: 12 }, () => 0);
+    const { min, max } = reviewMetricRange;
+    for (const value of reviewMetricValues) {
+      const index = Math.min(11, Math.max(0, Math.floor((value - min) / (max - min) * 12)));
+      buckets[index] += 1;
+    }
+    const largest = Math.max(...buckets, 1);
+    return buckets.map((count) => ({ count, ratio: count / largest }));
+  });
+  const reviewMetricThreshold = $derived(reviewMetricThresholdValue(reviewQualityMetric));
+  const reviewThresholdPosition = $derived(Math.max(0, Math.min(100, (reviewMetricThreshold - reviewMetricRange.min) / (reviewMetricRange.max - reviewMetricRange.min) * 100)));
+  const reviewEstimatedImpact = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewQualityFails(item)).length);
+  const reviewThresholdSamples = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewMetricValue(item, reviewQualityMetric) !== null).slice().sort((left, right) => Math.abs((reviewMetricValue(left, reviewQualityMetric) ?? 0) - reviewMetricThreshold) - Math.abs((reviewMetricValue(right, reviewQualityMetric) ?? 0) - reviewMetricThreshold)).slice(0, 4));
   const shortcutHints = $derived.by(() => {
     if (activeSection === "review") return [["K", "保留"], ["X", "排除"], ["R", "恢复"], ["L", "锁定/解锁"], ["Enter", "设为代表图"]];
     if (inspectorTab === "export") return [["Ctrl+S", "检查计划"], ["Enter", "确认导出"], ["Esc", "返回处理"]];
@@ -380,6 +405,56 @@
   function reviewStatusLabel(item: ReviewItem) {
     const status = reviewEffectiveStatus(item);
     return status === "excluded" ? "人工排除" : status === "suggested" ? "建议排除" : status === "warning" ? "质量警告" : status === "error" ? "处理失败" : item.manualDecision === "keep" ? "人工保留" : "保留";
+  }
+
+  function reviewMetricValue(item: ReviewItem, metric: QualityMetricKey): number | null {
+    if (!item.metrics) return null;
+    if (metric === "sharpness") return item.metrics.sharpness;
+    if (metric === "low_information") return item.metrics.lowInformation;
+    if (metric === "underexposed") return item.metrics.underexposedRatio;
+    if (metric === "overexposed") return item.metrics.overexposedRatio;
+    return item.metrics.width * item.metrics.height;
+  }
+
+  function reviewThresholdForMetric(metric: QualityMetricKey) {
+    if (metric === "sharpness") return reviewMinSharpness;
+    if (metric === "low_information") return reviewMaxLowInformation / 100;
+    if (metric === "underexposed") return reviewMaxUnderexposed / 100;
+    if (metric === "overexposed") return reviewMaxOverexposed / 100;
+    return reviewMinWidth * reviewMinHeight;
+  }
+
+  function reviewMetricThresholdValue(metric: QualityMetricKey) {
+    return reviewThresholdForMetric(metric);
+  }
+
+  function reviewQualityFails(item: ReviewItem) {
+    const value = reviewMetricValue(item, reviewQualityMetric);
+    if (value === null) return false;
+    if (reviewQualityMetric === "sharpness" || reviewQualityMetric === "resolution") return value < reviewMetricThresholdValue(reviewQualityMetric);
+    return value > reviewMetricThresholdValue(reviewQualityMetric);
+  }
+
+  function reviewSortItems(left: ReviewItem, right: ReviewItem) {
+    if (reviewSort === "source") return left.sourceIdentifier.localeCompare(right.sourceIdentifier) || left.displayName.localeCompare(right.displayName);
+    const leftValue = reviewMetricValue(left, reviewSort as QualityMetricKey) ?? Number.POSITIVE_INFINITY;
+    const rightValue = reviewMetricValue(right, reviewSort as QualityMetricKey) ?? Number.POSITIVE_INFINITY;
+    return leftValue - rightValue || left.assetKey.localeCompare(right.assetKey);
+  }
+
+  function reviewMetricLabel(metric: QualityMetricKey) {
+    if (metric === "sharpness") return "清晰度";
+    if (metric === "low_information") return "低信息量";
+    if (metric === "underexposed") return "欠曝比例";
+    if (metric === "overexposed") return "过曝比例";
+    return "分辨率";
+  }
+
+  function formatReviewMetric(value: number | null, metric: QualityMetricKey) {
+    if (value === null) return "--";
+    if (metric === "underexposed" || metric === "overexposed" || metric === "low_information") return `${(value * 100).toFixed(1)}%`;
+    if (metric === "resolution") return `${Math.round(value).toLocaleString()} px`;
+    return value.toFixed(1);
   }
 
   function reviewThumbnailUrl(item: ReviewItem) {
@@ -1766,6 +1841,7 @@
         </select>
         <select bind:value={reviewSourceFilter} aria-label="来源筛选"><option value="all">全部来源</option>{#each reviewSourceOptions as source}<option value={source}>{source}</option>{/each}</select>
         <select bind:value={reviewGroupFilter} aria-label="相似组筛选"><option value="all">全部相似组</option>{#each reviewGroupOptions as group}<option value={group}>{group.replace("sim-", "组 ")}</option>{/each}</select>
+        <select bind:value={reviewSort} aria-label="审核排序"><option value="source">来源顺序</option><option value="sharpness">清晰度升序</option><option value="low_information">低信息量升序</option><option value="underexposed">欠曝比例升序</option><option value="overexposed">过曝比例升序</option><option value="resolution">分辨率升序</option></select>
         <span class="review-toolbar-spacer"></span>
         <button onclick={undoReviewAction} disabled={!reviewWorkspace?.canUndo || !!reviewBusy} title="撤销最近一次审核操作"><Undo2 size={14} />撤销</button>
         <button onclick={redoReviewAction} disabled={!reviewWorkspace?.canRedo || !!reviewBusy} title="重做已撤销的审核操作"><Redo2 size={14} />重做</button>
@@ -1977,6 +2053,15 @@
           <label><span>欠曝上限 %</span><input type="number" min="0" max="100" bind:value={reviewMaxUnderexposed} /></label>
           <label><span>过曝上限 %</span><input type="number" min="0" max="100" bind:value={reviewMaxOverexposed} /></label>
         </div>
+        <div class="subsection-heading"><span>阈值分布</span><select class="subsection-select" bind:value={reviewQualityMetric} aria-label="质量分布指标"><option value="sharpness">清晰度</option><option value="low_information">低信息量</option><option value="underexposed">欠曝比例</option><option value="overexposed">过曝比例</option><option value="resolution">分辨率</option></select></div>
+        {#if reviewWorkspace && reviewMetricValues.length}
+          <div class="quality-distribution" aria-label={`${reviewMetricLabel(reviewQualityMetric)}分布`}>
+            <div class="quality-bars">{#each reviewHistogram as bucket, index}<span class:threshold-near={Math.abs((index + 0.5) / 12 * 100 - reviewThresholdPosition) < 9} style:height={`${Math.max(4, bucket.ratio * 100)}%`} title={`${bucket.count} 张`}></span>{/each}<i style:left={`${reviewThresholdPosition}%`}></i></div>
+            <div class="quality-scale"><span>{formatReviewMetric(reviewMetricRange.min, reviewQualityMetric)}</span><strong>阈值 {formatReviewMetric(reviewMetricThreshold, reviewQualityMetric)}</strong><span>{formatReviewMetric(reviewMetricRange.max, reviewQualityMetric)}</span></div>
+          </div>
+          <div class="quality-impact"><span>按当前阈值预计影响</span><strong>{reviewEstimatedImpact}</strong><small>张 · 调整后需运行分析才会写入建议</small></div>
+          <div class="threshold-samples"><span>阈值附近样本</span>{#each reviewThresholdSamples as sample}<button onclick={() => selectReviewItem(sample)}><span>{sample.sourceIdentifier}</span><strong>{formatReviewMetric(reviewMetricValue(sample, reviewQualityMetric), reviewQualityMetric)}</strong></button>{/each}</div>
+        {:else}<span class="range-empty">运行分析后显示指标分布</span>{/if}
         <div class="subsection-heading"><span>视觉相似</span><ScanLine size={14} /></div>
         <label class="field-row"><span>比较范围</span><select bind:value={reviewSimilarityScope}><option value="source">同一来源</option><option value="source_group">同一来源组</option><option value="project">整个项目</option></select></label>
         <div class="analysis-grid coordinate-grid">
