@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{
     ProjectStore, StoredCandidateImage, StoredQualityAssessment, StoredReviewAsset,
-    StoredRoiProfile, StoredSourceAsset, StoredVideoSelection,
+    StoredReviewAuditEvent, StoredRoiProfile, StoredSourceAsset, StoredVideoSelection,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -297,6 +297,8 @@ pub struct ReviewSummary {
 pub struct ReviewWorkspace {
     pub items: Vec<ReviewItem>,
     pub summary: ReviewSummary,
+    pub can_undo: bool,
+    pub can_redo: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1017,7 +1019,14 @@ pub fn list_review_workspace(
         locked: items.iter().filter(|item| item.locked).count() as u64,
         similarity_groups: groups,
     };
-    Ok(ReviewWorkspace { items, summary })
+    let can_undo = store.latest_undoable_review_audit()?.is_some();
+    let can_redo = store.latest_redo_review_audit()?.is_some();
+    Ok(ReviewWorkspace {
+        items,
+        summary,
+        can_undo,
+        can_redo,
+    })
 }
 
 pub fn update_review_items(
@@ -1077,6 +1086,45 @@ pub fn update_review_items(
         )?;
     }
     list_review_workspace(session)
+}
+
+pub fn undo_review_action(session: &ProjectSession) -> Result<ReviewWorkspace, ApplicationError> {
+    let store = ProjectStore::open(session.database_path())?;
+    let event = store
+        .latest_undoable_review_audit()?
+        .ok_or(ApplicationError::NoReviewUndoAvailable)?;
+    apply_review_audit_snapshot(&store, &event, false)?;
+    store.mark_review_audit_undone(&event.id, &Utc::now().to_rfc3339())?;
+    list_review_workspace(session)
+}
+
+pub fn redo_review_action(session: &ProjectSession) -> Result<ReviewWorkspace, ApplicationError> {
+    let store = ProjectStore::open(session.database_path())?;
+    let event = store
+        .latest_redo_review_audit()?
+        .ok_or(ApplicationError::NoReviewRedoAvailable)?;
+    apply_review_audit_snapshot(&store, &event, true)?;
+    store.mark_review_audit_redone(&event.id)?;
+    list_review_workspace(session)
+}
+
+fn apply_review_audit_snapshot(
+    store: &ProjectStore,
+    event: &StoredReviewAuditEvent,
+    use_after: bool,
+) -> Result<(), ApplicationError> {
+    let snapshot: StoredReviewAsset = serde_json::from_str(if use_after {
+        &event.after_json
+    } else {
+        &event.before_json
+    })?;
+    store.set_review_state(
+        &event.asset_key,
+        snapshot.manual_decision.as_deref(),
+        snapshot.locked,
+        &Utc::now().to_rfc3339(),
+    )?;
+    Ok(())
 }
 
 fn analyze_review_input(
@@ -2965,6 +3013,10 @@ pub enum ApplicationError {
     SimilarityComparisonTooLarge,
     #[error("所选审核项不属于相似组")]
     ReviewAssetHasNoSimilarityGroup,
+    #[error("没有可撤销的审核操作")]
+    NoReviewUndoAvailable,
+    #[error("没有可重做的审核操作")]
+    NoReviewRedoAvailable,
     #[error("找不到候选图片：{0}")]
     CandidateNotFound(String),
     #[error("候选图片不属于当前源素材")]
@@ -3072,6 +3124,30 @@ mod project_tests {
             .find(|item| item.asset_key == initially_representative)
             .unwrap();
         assert_eq!(excluded.manual_decision.as_deref(), Some("exclude"));
+
+        let undone = undo_review_action(&session).unwrap();
+        assert!(undone.can_redo);
+        assert!(
+            undone
+                .items
+                .iter()
+                .find(|item| item.asset_key == initially_representative)
+                .unwrap()
+                .manual_decision
+                .is_none()
+        );
+        let redone = redo_review_action(&session).unwrap();
+        assert!(redone.can_undo);
+        assert_eq!(
+            redone
+                .items
+                .iter()
+                .find(|item| item.asset_key == initially_representative)
+                .unwrap()
+                .manual_decision
+                .as_deref(),
+            Some("exclude")
+        );
 
         let sources = list_sources(&session, 0, 10).unwrap();
         let output = root.join("export");

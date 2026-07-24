@@ -54,6 +54,8 @@
     Timer,
     Trash2,
     Unlock,
+    Undo2,
+    Redo2,
     Video,
     X,
   } from "lucide-svelte";
@@ -171,7 +173,7 @@
     total: number; keep: number; suggestedExclude: number; manuallyExcluded: number;
     warning: number; failed: number; locked: number; similarityGroups: number;
   };
-  type ReviewWorkspace = { items: ReviewItem[]; summary: ReviewSummary };
+  type ReviewWorkspace = { items: ReviewItem[]; summary: ReviewSummary; canUndo: boolean; canRedo: boolean };
 
   const sections = [
     { id: "sources", label: "素材", icon: Images },
@@ -455,6 +457,34 @@
       reviewWorkspace = await invoke<ReviewWorkspace>("update_review_items", { assetKeys: keys, action });
       if (action !== "lock" && action !== "unlock") checkedReviewKeys = new Set();
       setMessage(`已更新 ${keys.length} 个审核项`);
+    } catch (error) {
+      setMessage(errorText(error), "error");
+    } finally {
+      reviewBusy = "";
+    }
+  }
+
+  async function undoReviewAction() {
+    if (!reviewWorkspace?.canUndo || reviewBusy) return;
+    reviewBusy = "正在撤销审核操作";
+    try {
+      reviewWorkspace = await invoke<ReviewWorkspace>("undo_review_action");
+      checkedReviewKeys = new Set();
+      setMessage("已撤销最近一次审核操作");
+    } catch (error) {
+      setMessage(errorText(error), "error");
+    } finally {
+      reviewBusy = "";
+    }
+  }
+
+  async function redoReviewAction() {
+    if (!reviewWorkspace?.canRedo || reviewBusy) return;
+    reviewBusy = "正在重做审核操作";
+    try {
+      reviewWorkspace = await invoke<ReviewWorkspace>("redo_review_action");
+      checkedReviewKeys = new Set();
+      setMessage("已重做审核操作");
     } catch (error) {
       setMessage(errorText(error), "error");
     } finally {
@@ -1483,6 +1513,12 @@
         else if (inspectorTab === "roi" && selectedSource) void saveRoi();
         return;
       }
+      if (activeSection === "review" && commandKey && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) void redoReviewAction();
+        else void undoReviewAction();
+        return;
+      }
       if (commandKey && event.key.toLowerCase() === "o") {
         event.preventDefault();
         void chooseProject();
@@ -1731,6 +1767,8 @@
         <select bind:value={reviewSourceFilter} aria-label="来源筛选"><option value="all">全部来源</option>{#each reviewSourceOptions as source}<option value={source}>{source}</option>{/each}</select>
         <select bind:value={reviewGroupFilter} aria-label="相似组筛选"><option value="all">全部相似组</option>{#each reviewGroupOptions as group}<option value={group}>{group.replace("sim-", "组 ")}</option>{/each}</select>
         <span class="review-toolbar-spacer"></span>
+        <button onclick={undoReviewAction} disabled={!reviewWorkspace?.canUndo || !!reviewBusy} title="撤销最近一次审核操作"><Undo2 size={14} />撤销</button>
+        <button onclick={redoReviewAction} disabled={!reviewWorkspace?.canRedo || !!reviewBusy} title="重做已撤销的审核操作"><Redo2 size={14} />重做</button>
         <button onclick={() => applyReviewAction("keep")} disabled={!checkedReviewKeys.size && !selectedReviewKey}><Check size={14} />保留</button>
         <button onclick={() => applyReviewAction("exclude")} disabled={!checkedReviewKeys.size && !selectedReviewKey}><X size={14} />排除</button>
         <button onclick={() => applyReviewAction("restore")} disabled={!checkedReviewKeys.size && !selectedReviewKey}><RotateCcw size={14} />恢复</button>

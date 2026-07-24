@@ -160,6 +160,14 @@ CREATE INDEX IF NOT EXISTS idx_review_audit_asset
 ON review_audit_events(asset_key, created_at);
 "#;
 
+const MIGRATION_5: &str = r#"
+CREATE TABLE IF NOT EXISTS review_redo_events (
+    audit_id TEXT PRIMARY KEY,
+    moved_at TEXT NOT NULL,
+    FOREIGN KEY(audit_id) REFERENCES review_audit_events(id) ON DELETE CASCADE
+);
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageProbe {
     pub sqlite_version: String,
@@ -276,6 +284,16 @@ pub struct StoredReviewAsset {
     pub representative: bool,
     pub locked_conflict: bool,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredReviewAuditEvent {
+    pub id: String,
+    pub asset_key: String,
+    pub action: String,
+    pub before_json: String,
+    pub after_json: String,
 }
 
 pub struct ProjectStore {
@@ -893,10 +911,62 @@ impl ProjectStore {
         actor: &str,
         created_at: &str,
     ) -> Result<(), StorageError> {
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM review_redo_events", [])?;
+        transaction.execute(
             "INSERT INTO review_audit_events(id, asset_key, action, before_json, after_json, actor, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, asset_key, action, before_json, after_json, actor, created_at],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_undoable_review_audit(
+        &self,
+    ) -> Result<Option<StoredReviewAuditEvent>, StorageError> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT id, asset_key, action, before_json, after_json
+             FROM review_audit_events
+             WHERE action != 'make_representative'
+               AND NOT EXISTS(SELECT 1 FROM review_redo_events WHERE audit_id=review_audit_events.id)
+             ORDER BY rowid DESC LIMIT 1",
+            [],
+            row_to_review_audit,
+        ).optional()?)
+    }
+
+    pub fn latest_redo_review_audit(&self) -> Result<Option<StoredReviewAuditEvent>, StorageError> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT review_audit_events.id, asset_key, action, before_json, after_json
+             FROM review_redo_events JOIN review_audit_events ON audit_id=review_audit_events.id
+             ORDER BY review_redo_events.rowid DESC LIMIT 1",
+                [],
+                row_to_review_audit,
+            )
+            .optional()?)
+    }
+
+    pub fn mark_review_audit_undone(
+        &self,
+        audit_id: &str,
+        moved_at: &str,
+    ) -> Result<(), StorageError> {
+        self.connection()?.execute(
+            "INSERT OR REPLACE INTO review_redo_events(audit_id, moved_at) VALUES (?1, ?2)",
+            params![audit_id, moved_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_review_audit_redone(&self, audit_id: &str) -> Result<(), StorageError> {
+        self.connection()?.execute(
+            "DELETE FROM review_redo_events WHERE audit_id=?1",
+            params![audit_id],
         )?;
         Ok(())
     }
@@ -948,6 +1018,11 @@ fn apply_migrations(connection: &Connection) -> Result<(), StorageError> {
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
         params![4_i64],
+    )?;
+    connection.execute_batch(MIGRATION_5)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+        params![5_i64],
     )?;
     Ok(())
 }
@@ -1077,6 +1152,16 @@ fn row_to_review_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReview
     })
 }
 
+fn row_to_review_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReviewAuditEvent> {
+    Ok(StoredReviewAuditEvent {
+        id: row.get(0)?,
+        asset_key: row.get(1)?,
+        action: row.get(2)?,
+        before_json: row.get(3)?,
+        after_json: row.get(4)?,
+    })
+}
+
 pub fn probe_in_memory() -> Result<StorageProbe, StorageError> {
     let connection = Connection::open_in_memory()?;
     apply_migrations(&connection)?;
@@ -1107,7 +1192,7 @@ mod tests {
     #[test]
     fn applies_initial_schema() {
         let probe = probe_in_memory().expect("in-memory SQLite should initialize");
-        assert_eq!(probe.schema_version, 4);
+        assert_eq!(probe.schema_version, 5);
         assert!(!probe.sqlite_version.is_empty());
     }
 

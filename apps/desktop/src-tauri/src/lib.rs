@@ -18,10 +18,11 @@ use application::{
     list_candidates as list_project_candidates, list_effective_roi_profiles,
     list_review_workspace as list_project_review_workspace, list_sources as list_project_sources,
     list_video_selections, plan_export as plan_project_export, preview_source_tiles,
-    read_recent_project, refresh_source_status as refresh_project_source_status,
-    refresh_source_statuses, relink_source as relink_project_source,
-    run_export as run_project_export, run_review_analysis as run_project_review_analysis,
-    save_roi_profile as save_project_roi_profile,
+    read_recent_project, redo_review_action as redo_project_review_action,
+    refresh_source_status as refresh_project_source_status, refresh_source_statuses,
+    relink_source as relink_project_source, run_export as run_project_export,
+    run_review_analysis as run_project_review_analysis,
+    save_roi_profile as save_project_roi_profile, undo_review_action as undo_project_review_action,
     update_review_items as update_project_review_items, video_frame_timestamps,
     write_recent_project,
 };
@@ -419,6 +420,20 @@ async fn update_review_items(
 }
 
 #[tauri::command]
+fn undo_review_action(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    undo_project_review_action(session).map_err(error_text)
+}
+
+#[tauri::command]
+fn redo_review_action(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+    let guard = state.session.lock().map_err(lock_error)?;
+    let session = guard.as_ref().ok_or_else(no_project)?;
+    redo_project_review_action(session).map_err(error_text)
+}
+
+#[tauri::command]
 async fn capture_video_frame(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -701,6 +716,8 @@ pub fn run() {
             run_review_analysis,
             get_review_workspace,
             update_review_items,
+            undo_review_action,
+            redo_review_action,
             capture_video_frame,
             estimate_video_sampling,
             run_video_sampling,
