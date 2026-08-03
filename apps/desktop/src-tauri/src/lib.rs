@@ -5,23 +5,26 @@ use std::{
 
 use application::{
     CandidateDeletionResult, CaptureResult, ChangeAnalysisResult, ComponentHealth, ExportPlan,
-    ExportRequest, ExportResult, GroupSamplingEstimate, ImportResult, M0Status, ProjectSession,
-    ProjectSummary, ReviewAction, ReviewAnalysisConfig, ReviewWorkspace, RoiProfile,
-    SamplingConfig, SamplingEstimate, SamplingExecutionResult, SaveRoiProfile,
-    SourceDeletionProgress, SourceDeletionResult, TilePreview, analyze_changes,
-    capture_manual_frame, complete_pending_hashes, create_video_selection,
+    ExportRequest, ExportResult, GroupSamplingEstimate, ImportProgress, ImportResult, M0Status,
+    OperationProgress, ProjectSession, ProjectSummary, ReviewAction, ReviewAnalysisConfig,
+    ReviewWorkspace, RoiProfile, SamplingConfig, SamplingEstimate, SamplingExecutionResult,
+    SaveRoiProfile, SourceDeletionProgress, SourceDeletionResult, TilePreview, VideoPreview,
+    analyze_changes, capture_manual_frame, complete_pending_hashes, create_video_selection,
     delete_candidates as delete_project_candidates,
     delete_roi_profile as delete_project_roi_profile,
     delete_sources_with_progress as delete_project_sources_with_progress, delete_video_selection,
-    estimate_group_sampling, estimate_sampling, execute_group_sampling, execute_sampling,
-    import_sources as import_project_sources, list_all_source_ids as list_project_source_ids,
-    list_candidates as list_project_candidates, list_effective_roi_profiles,
-    list_review_workspace as list_project_review_workspace, list_sources as list_project_sources,
-    list_video_selections, plan_export as plan_project_export, preview_source_tiles,
+    estimate_group_sampling, estimate_sampling, execute_group_sampling_with_progress,
+    execute_sampling_with_progress, execute_video_preview,
+    import_sources_with_progress as import_project_sources_with_progress,
+    list_all_source_ids as list_project_source_ids, list_candidates as list_project_candidates,
+    list_effective_roi_profiles, list_review_workspace_at as list_project_review_workspace_at,
+    list_sources as list_project_sources, list_video_selections,
+    plan_export as plan_project_export, plan_video_preview, preview_source_tiles,
     read_recent_project, redo_review_action as redo_project_review_action,
     refresh_source_status as refresh_project_source_status, refresh_source_statuses,
-    relink_source as relink_project_source, run_export as run_project_export,
-    run_review_analysis as run_project_review_analysis,
+    relink_source as relink_project_source,
+    run_export_with_progress as run_project_export_with_progress,
+    run_review_analysis_at as run_project_review_analysis_at,
     save_roi_profile as save_project_roi_profile, undo_review_action as undo_project_review_action,
     update_review_items as update_project_review_items, video_frame_timestamps,
     write_recent_project,
@@ -33,10 +36,27 @@ use job_engine::JobStateMachine;
 use storage::{StoredCandidateImage, StoredSourceAsset, StoredVideoSelection};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoPreviewProgress {
+    source_id: String,
+    percent: u8,
+}
+
 #[derive(Clone)]
 struct AppState {
     session: Arc<Mutex<Option<ProjectSession>>>,
+    project_database: Arc<Mutex<Option<PathBuf>>>,
     recent_config: PathBuf,
+}
+
+fn current_project_database(state: &AppState) -> Result<PathBuf, String> {
+    state
+        .project_database
+        .lock()
+        .map_err(lock_error)?
+        .clone()
+        .ok_or_else(no_project)
 }
 
 #[tauri::command]
@@ -142,8 +162,10 @@ fn create_project(
     session.backup_database().map_err(error_text)?;
     register_project_scope(&app, &session).map_err(error_text)?;
     let summary = session.summary.clone();
+    let database_path = session.database_path();
     write_recent_project(&state.recent_config, &summary.path).map_err(error_text)?;
     *state.session.lock().map_err(lock_error)? = Some(session);
+    *state.project_database.lock().map_err(lock_error)? = Some(database_path);
     Ok(summary)
 }
 
@@ -167,14 +189,17 @@ fn open_project(
     session.backup_database().map_err(error_text)?;
     register_project_scope(&app, &session).map_err(error_text)?;
     let summary = session.summary.clone();
+    let database_path = session.database_path();
     write_recent_project(&state.recent_config, &summary.path).map_err(error_text)?;
     *state.session.lock().map_err(lock_error)? = Some(session);
+    *state.project_database.lock().map_err(lock_error)? = Some(database_path);
     Ok(summary)
 }
 
 #[tauri::command]
 fn close_project(state: State<'_, AppState>) -> Result<(), String> {
     *state.session.lock().map_err(lock_error)? = None;
+    *state.project_database.lock().map_err(lock_error)? = None;
     Ok(())
 }
 
@@ -205,8 +230,16 @@ async fn import_sources(
         let ffmpeg = external_tool(&app, "ffmpeg");
         let mut guard = state.session.lock().map_err(lock_error)?;
         let session = guard.as_mut().ok_or_else(no_project)?;
-        let result =
-            import_project_sources(session, &paths, &ffprobe, &ffmpeg).map_err(error_text)?;
+        let result = import_project_sources_with_progress(
+            session,
+            &paths,
+            &ffprobe,
+            &ffmpeg,
+            |progress: ImportProgress| {
+                let _ = app.emit("import-progress", progress);
+            },
+        )
+        .map_err(error_text)?;
         register_project_scope(&app, session).map_err(error_text)?;
         Ok::<_, String>((result, session.database_path()))
     })
@@ -298,6 +331,41 @@ async fn get_video_frame_timestamps(
 }
 
 #[tauri::command]
+async fn prepare_video_preview(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: String,
+    force_transcode: bool,
+) -> Result<VideoPreview, String> {
+    let plan = {
+        let guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_ref().ok_or_else(no_project)?;
+        plan_video_preview(session, &source_id, force_transcode).map_err(error_text)?
+    };
+    let ffmpeg = external_tool(&app, "ffmpeg");
+    let progress_app = app.clone();
+    let progress_source_id = source_id.clone();
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        execute_video_preview(plan, &ffmpeg, |percent| {
+            let _ = progress_app.emit(
+                "video-preview-progress",
+                VideoPreviewProgress {
+                    source_id: progress_source_id.clone(),
+                    percent,
+                },
+            );
+        })
+        .map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    app.asset_protocol_scope()
+        .allow_file(PathBuf::from(&preview.path))
+        .map_err(error_text)?;
+    Ok(preview)
+}
+
+#[tauri::command]
 fn get_video_selections(
     state: State<'_, AppState>,
     source_id: String,
@@ -386,21 +454,22 @@ async fn run_review_analysis(
     state: State<'_, AppState>,
     config: ReviewAnalysisConfig,
 ) -> Result<ReviewWorkspace, String> {
-    let state = state.inner().clone();
+    let database_path = current_project_database(state.inner())?;
     tauri::async_runtime::spawn_blocking(move || {
-        let guard = state.session.lock().map_err(lock_error)?;
-        let session = guard.as_ref().ok_or_else(no_project)?;
-        run_project_review_analysis(session, &config).map_err(error_text)
+        run_project_review_analysis_at(database_path, &config).map_err(error_text)
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn get_review_workspace(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
-    let guard = state.session.lock().map_err(lock_error)?;
-    let session = guard.as_ref().ok_or_else(no_project)?;
-    list_project_review_workspace(session).map_err(error_text)
+async fn get_review_workspace(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+    let database_path = current_project_database(state.inner())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        list_project_review_workspace_at(database_path).map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -484,7 +553,17 @@ async fn run_video_sampling(
         let ffmpeg = external_tool(&app, "ffmpeg");
         let mut guard = state.session.lock().map_err(lock_error)?;
         let session = guard.as_mut().ok_or_else(no_project)?;
-        execute_sampling(session, &source_id, &config, &ffprobe, &ffmpeg).map_err(error_text)
+        execute_sampling_with_progress(
+            session,
+            &source_id,
+            &config,
+            &ffprobe,
+            &ffmpeg,
+            |progress: OperationProgress| {
+                let _ = app.emit("sampling-progress", progress);
+            },
+        )
+        .map_err(error_text)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -551,8 +630,17 @@ async fn run_source_group_sampling(
         let ffmpeg = external_tool(&app, "ffmpeg");
         let mut guard = state.session.lock().map_err(lock_error)?;
         let session = guard.as_mut().ok_or_else(no_project)?;
-        execute_group_sampling(session, &source_group, &config, &ffprobe, &ffmpeg)
-            .map_err(error_text)
+        execute_group_sampling_with_progress(
+            session,
+            &source_group,
+            &config,
+            &ffprobe,
+            &ffmpeg,
+            |progress: OperationProgress| {
+                let _ = app.emit("sampling-progress", progress);
+            },
+        )
+        .map_err(error_text)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -622,6 +710,7 @@ fn plan_export(state: State<'_, AppState>, request: ExportRequest) -> Result<Exp
 
 #[tauri::command]
 async fn run_export(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: ExportRequest,
 ) -> Result<ExportResult, String> {
@@ -629,7 +718,10 @@ async fn run_export(
     tauri::async_runtime::spawn_blocking(move || {
         let guard = state.session.lock().map_err(lock_error)?;
         let session = guard.as_ref().ok_or_else(no_project)?;
-        run_project_export(session, &request).map_err(error_text)
+        run_project_export_with_progress(session, &request, |progress: OperationProgress| {
+            let _ = app.emit("export-progress", progress);
+        })
+        .map_err(error_text)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -681,6 +773,24 @@ fn no_project() -> String {
     "请先创建或打开项目".to_owned()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_database_lookup_does_not_wait_for_long_session_operation() {
+        let database_path = PathBuf::from(r"C:\free-train-test\project.sqlite");
+        let state = AppState {
+            session: Arc::new(Mutex::new(None)),
+            project_database: Arc::new(Mutex::new(Some(database_path.clone()))),
+            recent_config: PathBuf::new(),
+        };
+        let _session_guard = state.session.lock().unwrap();
+
+        assert_eq!(current_project_database(&state).unwrap(), database_path);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -689,6 +799,7 @@ pub fn run() {
             let recent_config = app.path().app_config_dir()?.join("recent-project.json");
             app.manage(AppState {
                 session: Arc::new(Mutex::new(None)),
+                project_database: Arc::new(Mutex::new(None)),
                 recent_config,
             });
             Ok(())
@@ -707,6 +818,7 @@ pub fn run() {
             check_source_status,
             relink_source,
             get_video_frame_timestamps,
+            prepare_video_preview,
             get_video_selections,
             add_video_selection,
             remove_video_selection,

@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader, Read},
+    io::{BufRead, BufReader, Read},
     path::Path,
     process::{Command, Stdio},
 };
@@ -238,10 +238,10 @@ pub fn extract_video_frame(
 ) -> Result<(), MediaError> {
     let timestamp = format!("{:.6}", timestamp_ms as f64 / 1000.0);
     let output = media_command(executable)
-        .args(["-v", "error", "-y"])
+        .args(["-v", "error", "-y", "-threads", "1", "-ss", &timestamp])
         .arg("-i")
         .arg(source.as_ref())
-        .args(["-ss", &timestamp, "-frames:v", "1", "-q:v", "2"])
+        .args(["-frames:v", "1", "-q:v", "2"])
         .arg(destination.as_ref())
         .output()?;
     if !output.status.success() {
@@ -250,6 +250,107 @@ pub fn extract_video_frame(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
+    Ok(())
+}
+
+pub fn extract_video_frames_batch<F>(
+    executable: impl AsRef<Path>,
+    source: impl AsRef<Path>,
+    filter: &str,
+    destination_dir: impl AsRef<Path>,
+    duration_ms: u64,
+    mut report_progress: F,
+) -> Result<Vec<std::path::PathBuf>, MediaError>
+where
+    F: FnMut(u8),
+{
+    let executable = executable.as_ref();
+    let source = source.as_ref();
+    let destination_dir = destination_dir.as_ref();
+
+    #[cfg(windows)]
+    match run_video_frame_batch(
+        executable,
+        source,
+        filter,
+        destination_dir,
+        duration_ms,
+        &["-hwaccel", "d3d11va"],
+        &mut report_progress,
+    ) {
+        Ok(paths) => return Ok(paths),
+        Err(_) => reset_batch_directory(destination_dir)?,
+    }
+
+    run_video_frame_batch(
+        executable,
+        source,
+        filter,
+        destination_dir,
+        duration_ms,
+        &[],
+        &mut report_progress,
+    )
+}
+
+fn run_video_frame_batch<F>(
+    executable: &Path,
+    source: &Path,
+    filter: &str,
+    destination_dir: &Path,
+    duration_ms: u64,
+    input_args: &[&str],
+    report_progress: &mut F,
+) -> Result<Vec<std::path::PathBuf>, MediaError>
+where
+    F: FnMut(u8),
+{
+    reset_batch_directory(destination_dir)?;
+    let output_pattern = destination_dir.join("frame-%08d.jpg");
+    let mut child = media_command(executable)
+        .args(["-v", "error", "-y", "-threads", "1"])
+        .args(input_args)
+        .arg("-i")
+        .arg(source)
+        .args(["-an", "-sn", "-vf", filter, "-fps_mode", "vfr", "-q:v", "2"])
+        .args(["-progress", "pipe:1", "-nostats"])
+        .arg(&output_pattern)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or(MediaError::MissingProcessPipe)?;
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        if let Some(value) = line.strip_prefix("out_time_us=")
+            && let Ok(elapsed_us) = value.parse::<u64>()
+            && duration_ms > 0
+        {
+            let percent = ((elapsed_us / 1_000).saturating_mul(100) / duration_ms).min(99) as u8;
+            report_progress(percent);
+        }
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(MediaError::CommandFailedWithMessage(
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let mut paths = std::fs::read_dir(destination_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "jpg"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    report_progress(100);
+    Ok(paths)
+}
+
+fn reset_batch_directory(path: &Path) -> Result<(), MediaError> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    std::fs::create_dir_all(path)?;
     Ok(())
 }
 
@@ -365,7 +466,7 @@ pub fn create_video_thumbnail(
     destination: impl AsRef<Path>,
 ) -> Result<(), MediaError> {
     let output = media_command(executable)
-        .args(["-v", "error", "-y", "-ss", "0"])
+        .args(["-v", "error", "-y", "-threads", "1", "-ss", "0"])
         .arg("-i")
         .arg(source.as_ref())
         .args([
@@ -381,6 +482,159 @@ pub fn create_video_thumbnail(
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
+    }
+    Ok(())
+}
+
+pub fn create_browser_video_preview<F>(
+    executable: impl AsRef<Path>,
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    duration_ms: u64,
+    mut report_progress: F,
+) -> Result<(), MediaError>
+where
+    F: FnMut(u8),
+{
+    let executable = executable.as_ref();
+    let source = source.as_ref();
+    let destination = destination.as_ref();
+    let mut failures = Vec::new();
+    let software = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "32",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "30",
+        "-keyint_min",
+        "30",
+        "-sc_threshold",
+        "0",
+    ];
+
+    #[cfg(windows)]
+    match run_browser_preview_encoder(
+        executable,
+        source,
+        destination,
+        duration_ms,
+        &["-hwaccel", "d3d11va"],
+        &software,
+        &mut report_progress,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(error) => failures.push(format!("D3D11VA + libx264: {error}")),
+    }
+
+    match run_browser_preview_encoder(
+        executable,
+        source,
+        destination,
+        duration_ms,
+        &[],
+        &software,
+        &mut report_progress,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            failures.push(format!("libx264: {error}"));
+            Err(MediaError::VideoPreviewFailed(failures.join("；")))
+        }
+    }
+}
+
+fn run_browser_preview_encoder<F>(
+    executable: &Path,
+    source: &Path,
+    destination: &Path,
+    duration_ms: u64,
+    input_args: &[&str],
+    encoder_args: &[&str],
+    report_progress: &mut F,
+) -> Result<(), MediaError>
+where
+    F: FnMut(u8),
+{
+    if destination.is_file() {
+        std::fs::remove_file(destination)?;
+    }
+    let mut command = media_command(executable);
+    command
+        .args(["-v", "error", "-y", "-threads", "1"])
+        .args(input_args)
+        .arg("-i")
+        .arg(source)
+        .args(["-map", "0:v:0", "-an"])
+        .args([
+            "-vf",
+            "fps=30,scale=960:540:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        ])
+        .args(encoder_args)
+        .args([
+            "-fps_mode",
+            "cfr",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ])
+        .arg(destination)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().ok_or(MediaError::MissingProcessPipe)?;
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        if let Some(value) = line.strip_prefix("out_time_us=")
+            && let Ok(elapsed_us) = value.parse::<u64>()
+            && duration_ms > 0
+        {
+            let percent = ((elapsed_us / 1_000).saturating_mul(100) / duration_ms).min(99) as u8;
+            report_progress(percent);
+        }
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(destination);
+        return Err(MediaError::CommandFailedWithMessage(
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    validate_browser_video_preview(executable, destination, duration_ms)?;
+    report_progress(100);
+    Ok(())
+}
+
+pub fn validate_browser_video_preview(
+    executable: impl AsRef<Path>,
+    source: impl AsRef<Path>,
+    duration_ms: u64,
+) -> Result<(), MediaError> {
+    let source = source.as_ref();
+    let last_sample = duration_ms.saturating_sub(1_000);
+    for timestamp_ms in [0, duration_ms / 2, last_sample] {
+        let timestamp = format!("{:.6}", timestamp_ms as f64 / 1_000.0);
+        let output = media_command(executable.as_ref())
+            .args(["-v", "error", "-threads", "1", "-ss", &timestamp])
+            .arg("-i")
+            .arg(source)
+            .args(["-frames:v", "1", "-f", "null", "-"])
+            .stdout(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(MediaError::CommandFailedWithMessage(
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -416,11 +670,24 @@ pub enum MediaError {
     InvalidAnalysisConfiguration,
     #[error("media process did not expose the expected pipe")]
     MissingProcessPipe,
+    #[error("无法生成浏览器兼容预览：{0}")]
+    VideoPreviewFailed(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "free-train-media-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn parses_minimal_ffprobe_document() {
@@ -430,6 +697,49 @@ mod tests {
         .expect("valid ffprobe JSON");
         assert_eq!(document.streams[0].width, Some(1920));
         assert_eq!(document.format.unwrap().duration.as_deref(), Some("2.50"));
+    }
+
+    #[test]
+    fn batch_extracts_regular_video_frames_with_progress() {
+        if probe_ffprobe("ffmpeg").is_err() {
+            return;
+        }
+        let root = test_root("batch");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        let output = media_command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=30:duration=3",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let mut progress = Vec::new();
+        let frames = extract_video_frames_batch(
+            "ffmpeg",
+            &source,
+            "fps=1",
+            root.join("frames"),
+            3_000,
+            |percent| progress.push(percent),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(progress.last(), Some(&100));
+        assert!(frames.iter().all(|path| path.is_file()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -9,4 +9,4 @@
 Thumbs.db
 /resources/ffmpeg/runtime/*
 !/resources/ffmpeg/runtime/.gitkeep
-
+/FreeTrain-M1-Test/

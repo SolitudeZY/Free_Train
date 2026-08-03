@@ -3,15 +3,18 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
+  import { createVideoSeekCoordinator } from "$lib/video-seek.js";
   import {
     Activity,
     AlertCircle,
+    ArrowLeft,
     Camera,
     Check,
     ChevronDown,
     ChevronRight,
     CircleGauge,
     Clock3,
+    Columns3,
     Crop,
     Download,
     FileImage,
@@ -58,6 +61,8 @@
     Redo2,
     Video,
     X,
+    ZoomIn,
+    ZoomOut,
   } from "lucide-svelte";
   import { onMount } from "svelte";
 
@@ -107,6 +112,8 @@
   };
   type SourceDeletionResult = { deleted: number; candidateDeleted: number; failures: { path: string; error: string }[] };
   type SourceDeletionProgress = { completed: number; total: number; deleted: number; candidateDeleted: number };
+  type ImportProgress = { phase: string; completed: number; total: number; imported: number; updated: number; unsupported: number; failed: number };
+  type OperationProgress = { phase: string; completed: number; total: number; succeeded: number; existing: number; failed: number };
   type VideoSelection = { id: string; sourceId: string; startMs: number; endMs: number; label: string; protected: boolean; createdAt: string };
   type CandidateImage = {
     id: string; sourceId: string; videoOffsetMs: number; sourceFrameNumber: number | null;
@@ -118,8 +125,8 @@
     mode: SamplingMode; intervalMs: number; frameInterval: number; targetCount: number;
     rangeIds: string[]; customTimestampsMs: number[]; pinResults: boolean;
   };
-  type SamplingEstimate = { timestampsMs: number[]; estimatedCount: number };
-  type GroupSamplingEstimate = { sourceCount: number; estimatedCount: number };
+  type SamplingEstimate = { timestampsMs: number[]; estimatedCount: number; existingCount: number; estimatedNewCount: number };
+  type GroupSamplingEstimate = { sourceCount: number; estimatedCount: number; existingCount: number; estimatedNewCount: number };
   type SamplingExecutionResult = { planned: number; created: number; existing: number; failures: { path: string; error: string }[] };
   type CandidateDeletionResult = { deleted: number; failures: { path: string; error: string }[] };
   type ChangePoint = { timestampMs: number; score: number };
@@ -131,6 +138,7 @@
   type ExportContent = "frames" | "tiles";
   type ExportSourceScope = "current" | "source_group";
   type ExportCandidateScope = "all" | "selected";
+  type ExportReviewScope = "eligible" | "all";
   type ConflictStrategy = "append_sequence" | "append_hash" | "skip" | "fail";
   type RoiProfile = {
     id: string; scope: "source_group" | "source"; scopeValue: string; name: string;
@@ -175,6 +183,8 @@
     warning: number; failed: number; locked: number; similarityGroups: number;
   };
   type ReviewWorkspace = { items: ReviewItem[]; summary: ReviewSummary; canUndo: boolean; canRedo: boolean };
+  type VideoPreview = { path: string; isProxy: boolean };
+  type VideoPreviewProgress = { sourceId: string; percent: number };
 
   const sections = [
     { id: "sources", label: "素材", icon: Images },
@@ -208,6 +218,9 @@
   let sourceRemovalDialogOpen = $state(false);
   let pendingSourceRemovalIds = $state<string[]>([]);
   let sourceRemovalProgress = $state<SourceDeletionProgress | null>(null);
+  let importProgress = $state<ImportProgress | null>(null);
+  let samplingProgress = $state<OperationProgress | null>(null);
+  let exportProgress = $state<OperationProgress | null>(null);
   let sourceRemovalCompletion = $state<{ deleted: number; candidateDeleted: number } | null>(null);
   let sourceRemovalCompletionTimer: number | undefined;
   let dragActive = $state(false);
@@ -217,9 +230,16 @@
   let sourceContextMenu = $state<{ x: number; y: number } | null>(null);
   let sourcePanel: HTMLElement;
   let videoElement = $state<HTMLVideoElement>();
+  const videoSeekCoordinator = createVideoSeekCoordinator();
+  let videoPreviewPath = $state("");
+  let videoPreviewIsProxy = $state(false);
+  let videoPreviewBusy = $state("");
+  let videoPreviewProgress = $state(0);
+  let videoPreviewError = $state("");
+  let videoPreviewRequest = 0;
+  const videoPreviewJobs = new Map<string, Promise<VideoPreview>>();
   const checkingSourceIds = new Set<string>();
   let inspectorTab = $state<"info" | "sampling" | "roi" | "export">("info");
-  let frameTimestamps = $state<number[]>([]);
   let currentTimeMs = $state(0);
   let isPlaying = $state(false);
   let playbackRate = $state(1);
@@ -270,10 +290,11 @@
   let fillColor = $state("#000000");
   let exportDirectory = $state("");
   let namingTemplate = $state("{source}_{roi}_r{row}_c{col}_{index}");
-  let exportFormat = $state<ExportFormat>("png");
+  let exportFormat = $state<ExportFormat>("jpeg");
   let exportContent = $state<ExportContent>("tiles");
   let exportSourceScope = $state<ExportSourceScope>("current");
   let exportCandidateScope = $state<ExportCandidateScope>("all");
+  let exportReviewScope = $state<ExportReviewScope>("eligible");
   let conflictStrategy = $state<ConflictStrategy>("append_sequence");
   let exportPlan = $state<ExportPlan | null>(null);
   let exportBusy = $state("");
@@ -297,6 +318,18 @@
   let reviewTimeWindowSeconds = $state(30);
   let reviewQualityMetric = $state<QualityMetricKey>("sharpness");
   let reviewSort = $state("source");
+  let reviewComparisonGroupId = $state("");
+  let reviewComparisonZoom = $state(1);
+  let reviewComparisonPanX = $state(0);
+  let reviewComparisonPanY = $state(0);
+  let reviewComparisonDrag = $state<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  let samplingCompletion = $state<{ result: SamplingExecutionResult; sourceScope: ExportSourceScope } | null>(null);
   let roiDrag = $state<{
     mode: "create" | "move";
     startX: number;
@@ -309,6 +342,12 @@
   let roiAutoSaveTimer: number | undefined;
 
   const selectedSource = $derived(sources.find((source) => source.id === selectedSourceId) ?? null);
+  const activeVideoFrameRate = $derived(parseFrameRate(selectedSource?.frameRate));
+  const estimatedVideoFrameCount = $derived(
+    activeVideoFrameRate > 0 && selectedSource?.durationMs
+      ? Math.max(1, Math.round((selectedSource.durationMs / 1_000) * activeVideoFrameRate))
+      : 0,
+  );
   const allSourcesChecked = $derived((project?.sourceCount ?? 0) > 0 && checkedSourceIds.size === project?.sourceCount);
   const filteredSources = $derived(
     search.trim()
@@ -327,7 +366,11 @@
     }
     return [...groups.entries()];
   });
-  const previewUrl = $derived(selectedSource && verifiedSourceId === selectedSource.id ? convertFileSrc(selectedSource.absolutePath) : "");
+  const previewUrl = $derived.by(() => {
+    if (!selectedSource || verifiedSourceId !== selectedSource.id) return "";
+    const path = selectedSource.kind === "video" ? videoPreviewPath : selectedSource.absolutePath;
+    return path ? convertFileSrc(path) : "";
+  });
   const isActiveVideo = $derived(selectedSource?.kind === "video" && selectedSource.status === "online" && verifiedSourceId === selectedSource.id);
   const changeChartMaxTimestamp = $derived(Math.max(changeAnalysis?.points.at(-1)?.timestampMs ?? selectedSource?.durationMs ?? 1, 1));
   const changeChartMaxScore = $derived(Math.max(changeThreshold, ...(changeAnalysis?.points.map((point) => point.score) ?? []), 0.001));
@@ -345,6 +388,15 @@
   const tilePreviewTotal = $derived(tilePreviews.length + excludedTiles.size);
   const selectedSourceGroupCount = $derived(selectedSource ? sources.filter((source) => source.kind === selectedSource.kind && source.sourceGroup === selectedSource.sourceGroup).length : 0);
   const selectedReviewItem = $derived(reviewWorkspace?.items.find((item) => item.assetKey === selectedReviewKey) ?? null);
+  const suggestedReviewKeys = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewEffectiveStatus(item) === "suggested").map((item) => item.assetKey));
+  const reviewComparisonItems = $derived(
+    reviewComparisonGroupId
+      ? (reviewWorkspace?.items ?? []).filter((item) => item.similarityGroupId === reviewComparisonGroupId)
+      : [],
+  );
+  const reviewComparisonCheckedKeys = $derived(
+    reviewComparisonItems.filter((item) => checkedReviewKeys.has(item.assetKey)).map((item) => item.assetKey),
+  );
   const reviewSourceOptions = $derived([...new Set(reviewWorkspace?.items.map((item) => item.sourceIdentifier) ?? [])].sort());
   const reviewGroupOptions = $derived([...new Set((reviewWorkspace?.items.map((item) => item.similarityGroupId).filter(Boolean) as string[] | undefined) ?? [])].sort());
   const filteredReviewItems = $derived((reviewWorkspace?.items ?? []).filter((item) => {
@@ -370,14 +422,21 @@
       buckets[index] += 1;
     }
     const largest = Math.max(...buckets, 1);
-    return buckets.map((count) => ({ count, ratio: count / largest }));
+    return buckets.map((count, index) => ({
+      count,
+      ratio: count / largest,
+      start: min + ((max - min) * index) / buckets.length,
+      end: min + ((max - min) * (index + 1)) / buckets.length,
+    }));
   });
+  const reviewHistogramMax = $derived(Math.max(...reviewHistogram.map((bucket) => bucket.count), 0));
   const reviewMetricThreshold = $derived(reviewMetricThresholdValue(reviewQualityMetric));
   const reviewThresholdPosition = $derived(Math.max(0, Math.min(100, (reviewMetricThreshold - reviewMetricRange.min) / (reviewMetricRange.max - reviewMetricRange.min) * 100)));
   const reviewEstimatedImpact = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewQualityFails(item)).length);
   const reviewThresholdSamples = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewMetricValue(item, reviewQualityMetric) !== null).slice().sort((left, right) => Math.abs((reviewMetricValue(left, reviewQualityMetric) ?? 0) - reviewMetricThreshold) - Math.abs((reviewMetricValue(right, reviewQualityMetric) ?? 0) - reviewMetricThreshold)).slice(0, 4));
   const shortcutHints = $derived.by(() => {
-    if (activeSection === "review") return [["K", "保留"], ["X", "排除"], ["R", "恢复"], ["L", "锁定/解锁"], ["Enter", "设为代表图"]];
+    if (activeSection === "review" && reviewComparisonGroupId) return [["Esc", "返回网格"], ["+ / -", "同步缩放"], ["0", "复位视图"], ["拖动", "同步平移"], ["Enter", "设为代表图"]];
+    if (activeSection === "review") return [["K", "保留"], ["X", "排除"], ["R", "恢复"], ["L", "锁定/解锁"], ["Esc", "返回处理"]];
     if (inspectorTab === "export") return [["Ctrl+S", "检查计划"], ["Enter", "确认导出"], ["Esc", "返回处理"]];
     if (inspectorTab === "roi") return [["R", "新建 ROI"], ["拖动", "移动 ROI"], ["方向键", "微调"], ["Ctrl+S", "保存"], ["P", "保存并预览"]];
     if (isActiveVideo) return [["Space", "播放/暂停"], ["←/→", "逐帧"], ["A/D", "候选切换"], ["C", "保存帧"], ["I/O", "片段入/出点"]];
@@ -391,6 +450,16 @@
 
   function errorText(error: unknown) {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  function parseFrameRate(value: string | null | undefined) {
+    if (!value) return 0;
+    const [numeratorText, denominatorText = "1"] = value.split("/");
+    const numerator = Number(numeratorText);
+    const denominator = Number(denominatorText);
+    return Number.isFinite(numerator) && Number.isFinite(denominator) && numerator > 0 && denominator > 0
+      ? numerator / denominator
+      : 0;
   }
 
   function reviewEffectiveStatus(item: ReviewItem) {
@@ -450,6 +519,29 @@
     return "分辨率";
   }
 
+  function reviewMetricGuide(metric: QualityMetricKey) {
+    if (metric === "sharpness") return {
+      summary: "清晰度以画面边缘变化强度估算。数值越低，越可能存在失焦、运动模糊或细节不足。",
+      threshold: "红线左侧的图片低于最小清晰度，会计入当前阈值的影响数量。",
+    };
+    if (metric === "low_information") return {
+      summary: "低信息量综合灰度分布和亮度变化衡量画面内容是否单一。数值越高，画面越接近纯色、雾化或缺少可辨细节。",
+      threshold: "红线右侧的图片超过低信息量上限，会计入当前阈值的影响数量。",
+    };
+    if (metric === "underexposed") return {
+      summary: "欠曝比例是画面中接近黑色的像素占比。比例高表示暗部细节可能已经丢失。",
+      threshold: "红线右侧的图片超过欠曝上限，会计入当前阈值的影响数量。",
+    };
+    if (metric === "overexposed") return {
+      summary: "过曝比例是画面中接近白色的像素占比。比例高表示高光区域可能没有可恢复的细节。",
+      threshold: "红线右侧的图片超过过曝上限，会计入当前阈值的影响数量。",
+    };
+    return {
+      summary: "分辨率为宽度乘以高度的像素总数，用来识别尺寸不足的图片。",
+      threshold: "红线左侧的图片低于最小宽度乘最小高度，会计入当前阈值的影响数量。",
+    };
+  }
+
   function formatReviewMetric(value: number | null, metric: QualityMetricKey) {
     if (value === null) return "--";
     if (metric === "underexposed" || metric === "overexposed" || metric === "low_information") return `${(value * 100).toFixed(1)}%`;
@@ -481,12 +573,71 @@
     selectedReviewKey = item.assetKey;
   }
 
+  function openReviewComparison(item: ReviewItem) {
+    if (!item.similarityGroupId) return;
+    reviewComparisonGroupId = item.similarityGroupId;
+    selectedReviewKey = item.assetKey;
+    checkedReviewKeys = new Set();
+    resetReviewComparisonTransform();
+  }
+
+  function closeReviewComparison() {
+    reviewComparisonGroupId = "";
+    reviewComparisonDrag = null;
+    resetReviewComparisonTransform();
+  }
+
+  function resetReviewComparisonTransform() {
+    reviewComparisonZoom = 1;
+    reviewComparisonPanX = 0;
+    reviewComparisonPanY = 0;
+  }
+
+  function setReviewComparisonZoom(value: number) {
+    reviewComparisonZoom = Math.max(1, Math.min(4, value));
+    if (reviewComparisonZoom === 1) {
+      reviewComparisonPanX = 0;
+      reviewComparisonPanY = 0;
+    }
+  }
+
+  function zoomReviewComparison(event: WheelEvent) {
+    event.preventDefault();
+    setReviewComparisonZoom(reviewComparisonZoom + (event.deltaY < 0 ? 0.25 : -0.25));
+  }
+
+  function startReviewComparisonPan(event: PointerEvent) {
+    if (event.button !== 0 || reviewComparisonZoom <= 1) return;
+    event.preventDefault();
+    event.currentTarget instanceof HTMLElement && event.currentTarget.setPointerCapture(event.pointerId);
+    reviewComparisonDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: reviewComparisonPanX,
+      originY: reviewComparisonPanY,
+    };
+  }
+
+  function moveReviewComparisonPan(event: PointerEvent) {
+    if (!reviewComparisonDrag || reviewComparisonDrag.pointerId !== event.pointerId) return;
+    reviewComparisonPanX = reviewComparisonDrag.originX + event.clientX - reviewComparisonDrag.startX;
+    reviewComparisonPanY = reviewComparisonDrag.originY + event.clientY - reviewComparisonDrag.startY;
+  }
+
+  function endReviewComparisonPan(event: PointerEvent) {
+    if (reviewComparisonDrag?.pointerId === event.pointerId) reviewComparisonDrag = null;
+  }
+
   async function loadReviewWorkspace(quiet = false) {
     if (!project) return;
     try {
       reviewWorkspace = await invoke<ReviewWorkspace>("get_review_workspace");
       if (reviewWorkspace.items.length && !reviewWorkspace.items.some((item) => item.assetKey === selectedReviewKey)) {
         selectedReviewKey = reviewWorkspace.items[0].assetKey;
+      }
+      if (reviewComparisonGroupId && !reviewWorkspace.items.some((item) => item.similarityGroupId === reviewComparisonGroupId)) {
+        closeReviewComparison();
       }
     } catch (error) {
       reviewWorkspace = null;
@@ -514,6 +665,7 @@
         },
       });
       checkedReviewKeys = new Set();
+      closeReviewComparison();
       selectedReviewKey = reviewWorkspace.items[0]?.assetKey ?? "";
       reviewVisibleLimit = 400;
       setMessage(`分析完成：${reviewWorkspace.summary.total} 张审核资产，${reviewWorkspace.summary.similarityGroups} 个相似组，${reviewWorkspace.summary.suggestedExclude} 张建议排除`);
@@ -794,7 +946,7 @@
   }
 
   function resetVideoWorkspace() {
-    frameTimestamps = [];
+    videoSeekCoordinator.reset();
     currentTimeMs = 0;
     isPlaying = false;
     markInMs = null;
@@ -1070,6 +1222,7 @@
       format: exportFormat,
       conflictStrategy,
       content: exportContent,
+      reviewScope: exportReviewScope,
       excludedTiles: [...excludedTiles.values()],
     };
   }
@@ -1092,6 +1245,37 @@
   function setExportCandidateScope(scope: ExportCandidateScope) {
     exportCandidateScope = scope;
     exportPlan = null;
+  }
+
+  function setExportReviewScope(scope: ExportReviewScope) {
+    exportReviewScope = scope;
+    exportPlan = null;
+  }
+
+  async function openReviewedExport() {
+    const sourceId = selectedReviewItem?.sourceId ?? selectedSourceId;
+    if (!sourceId) return;
+    if (sourceId !== selectedSourceId) await selectSource(sourceId);
+    setExportContent("frames");
+    setExportSourceScope("current");
+    setExportCandidateScope("all");
+    setExportReviewScope("eligible");
+    activateSection("export");
+  }
+
+  function openDirectExportAfterSampling() {
+    const sourceScope = samplingCompletion?.sourceScope ?? "current";
+    samplingCompletion = null;
+    setExportContent("frames");
+    setExportSourceScope(sourceScope);
+    setExportCandidateScope("all");
+    setExportReviewScope("all");
+    activateSection("export");
+  }
+
+  async function reviewAfterSampling() {
+    samplingCompletion = null;
+    await runReviewAnalysis();
   }
 
   async function chooseExportDirectory() {
@@ -1123,6 +1307,7 @@
   async function executeExport() {
     if (!selectedSource || !exportDirectory || !exportPlan) return;
     exportBusy = exportContent === "frames" ? "正在导出候选帧与来源清单" : "正在导出切片与来源清单";
+    exportProgress = null;
     try {
       const result = await invoke<ExportResult>("run_export", { request: currentExportRequest() });
       setMessage("已导出 " + result.written + " 张，清单：" + result.manifestPath, result.failures.length ? "error" : "info");
@@ -1131,19 +1316,18 @@
       setMessage(errorText(error), "error");
     } finally {
       exportBusy = "";
+      exportProgress = null;
     }
   }
 
   async function loadVideoWorkspace(sourceId: string) {
-    videoBusy = "正在读取帧时间轴";
+    videoBusy = "正在读取候选与有效片段";
     try {
-      const [timestamps, selections, savedCandidates] = await Promise.all([
-        invoke<number[]>("get_video_frame_timestamps", { sourceId }),
+      const [selections, savedCandidates] = await Promise.all([
         invoke<VideoSelection[]>("get_video_selections", { sourceId }),
         invoke<CandidateImage[]>("get_candidates", { sourceId, offset: 0, limit: 10_000 }),
       ]);
       if (selectedSourceId !== sourceId) return;
-      frameTimestamps = timestamps;
       videoSelections = selections;
       candidates = savedCandidates;
       selectedCandidateId = "";
@@ -1157,28 +1341,134 @@
     }
   }
 
+  function resetVideoPreview() {
+    videoPreviewRequest += 1;
+    videoPreviewPath = "";
+    videoPreviewIsProxy = false;
+    videoPreviewBusy = "";
+    videoPreviewProgress = 0;
+    videoPreviewError = "";
+    videoSeekCoordinator.reset();
+  }
+
+  async function prepareVideoPreview(sourceId: string, forceTranscode = false) {
+    const request = ++videoPreviewRequest;
+    videoPreviewBusy = forceTranscode ? "正在生成兼容预览" : "正在检查视频兼容性";
+    videoPreviewProgress = 0;
+    videoPreviewError = "";
+    if (forceTranscode) videoPreviewPath = "";
+    try {
+      const jobKey = `${sourceId}:${forceTranscode}`;
+      let job = videoPreviewJobs.get(jobKey);
+      if (!job) {
+        job = invoke<VideoPreview>("prepare_video_preview", { sourceId, forceTranscode });
+        videoPreviewJobs.set(jobKey, job);
+        void job.then(
+          () => videoPreviewJobs.delete(jobKey),
+          () => videoPreviewJobs.delete(jobKey),
+        );
+      }
+      const preview = await job;
+      if (selectedSourceId !== sourceId || request !== videoPreviewRequest) return;
+      videoPreviewPath = preview.path;
+      videoPreviewIsProxy = preview.isProxy;
+      videoPreviewProgress = 100;
+      if (preview.isProxy) setMessage("兼容预览已准备；抽帧和导出仍使用原始视频");
+    } catch (error) {
+      if (selectedSourceId !== sourceId || request !== videoPreviewRequest) return;
+      videoPreviewError = errorText(error);
+      setMessage(videoPreviewError, "error");
+    } finally {
+      if (selectedSourceId === sourceId && request === videoPreviewRequest) videoPreviewBusy = "";
+    }
+  }
+
+  function issueVideoSeek(targetMs: number) {
+    const video = videoElement;
+    if (!video || video.readyState === 0) {
+      videoSeekCoordinator.reset();
+      return;
+    }
+    const actualMs = video.currentTime * 1_000;
+    if (Math.abs(actualMs - targetMs) <= 0.5) {
+      const next = videoSeekCoordinator.settle(actualMs);
+      if (next !== null) issueVideoSeek(next);
+      return;
+    }
+    video.currentTime = targetMs / 1_000;
+  }
+
   function seekTo(timestampMs: number) {
     const duration = selectedSource?.durationMs ?? 0;
     const clamped = Math.max(0, Math.min(timestampMs, duration));
     currentTimeMs = clamped;
     jumpTime = formatTimestamp(clamped);
-    if (videoElement) videoElement.currentTime = clamped / 1_000;
+    const target = videoSeekCoordinator.request(clamped);
+    if (target !== null) issueVideoSeek(target);
   }
 
   function stepFrame(direction: -1 | 1) {
-    if (!frameTimestamps.length) return;
-    const current = currentTimeMs;
-    if (direction > 0) {
-      seekTo(frameTimestamps.find((timestamp) => timestamp > current + 1) ?? frameTimestamps.at(-1) ?? current);
-    } else {
-      seekTo(frameTimestamps.findLast((timestamp) => timestamp < current - 1) ?? frameTimestamps[0]);
-    }
+    if (activeVideoFrameRate <= 0) return;
+    const frameDurationMs = 1_000 / activeVideoFrameRate;
+    const currentFrame = Math.round(currentTimeMs / frameDurationMs);
+    seekTo(Math.round(Math.max(0, currentFrame + direction) * frameDurationMs));
   }
 
   async function togglePlayback() {
-    if (!videoElement) return;
-    if (videoElement.paused) await videoElement.play();
-    else videoElement.pause();
+    if (!videoElement || !previewUrl) return;
+    try {
+      if (videoElement.paused) await videoElement.play();
+      else videoElement.pause();
+    } catch (error) {
+      setMessage(errorText(error), "error");
+    }
+  }
+
+  function handleVideoTimeUpdate(event: Event) {
+    const video = event.currentTarget as HTMLVideoElement;
+    if (videoSeekCoordinator.pending) return;
+    currentTimeMs = Math.round(video.currentTime * 1_000);
+    jumpTime = formatTimestamp(currentTimeMs);
+  }
+
+  function handleVideoSeeked(event: Event) {
+    const actualMs = (event.currentTarget as HTMLVideoElement).currentTime * 1_000;
+    const next = videoSeekCoordinator.settle(actualMs);
+    if (next !== null) issueVideoSeek(next);
+    else {
+      currentTimeMs = Math.round(actualMs);
+      jumpTime = formatTimestamp(currentTimeMs);
+    }
+  }
+
+  function handleVideoLoadedMetadata() {
+    videoPreviewError = "";
+    applyPlaybackRate(playbackRate);
+    if (currentTimeMs > 0) seekTo(currentTimeMs);
+  }
+
+  function handleVideoReady() {
+    videoPreviewError = "";
+  }
+
+  function handleVideoError(event: Event) {
+    const video = event.currentTarget as HTMLVideoElement;
+    const failedUrl = video.currentSrc;
+    window.setTimeout(() => {
+      if (video !== videoElement
+        || !previewUrl
+        || video.currentSrc !== failedUrl
+        || video.currentSrc !== previewUrl
+        || video.readyState >= HTMLMediaElement.HAVE_METADATA
+        || !video.error) return;
+      const code = video.error.code;
+      if (!videoPreviewIsProxy && selectedSource?.kind === "video" && !videoPreviewBusy) {
+        void prepareVideoPreview(selectedSource.id, true);
+        return;
+      }
+      videoPreviewError = `视频预览加载失败（媒体错误 ${code}）`;
+      setMessage(videoPreviewError, "error");
+    }, 0);
   }
 
   function applyPlaybackRate(rate: number) {
@@ -1256,7 +1546,7 @@
     try {
       if (applySourceGroup && !["valid_ranges", "change_triggered"].includes(samplingMode)) {
         const estimate = await invoke<GroupSamplingEstimate>("estimate_source_group_sampling", { sourceGroup: selectedSource.sourceGroup, config: currentSamplingConfig() });
-        samplingEstimate = { timestampsMs: [], estimatedCount: estimate.estimatedCount };
+        samplingEstimate = { timestampsMs: [], estimatedCount: estimate.estimatedCount, existingCount: estimate.existingCount, estimatedNewCount: estimate.estimatedNewCount };
         estimatedSourceCount = estimate.sourceCount;
       } else {
         samplingEstimate = await invoke<SamplingEstimate>("estimate_video_sampling", { sourceId: selectedSource.id, config: currentSamplingConfig() });
@@ -1264,7 +1554,7 @@
       }
       inspectorTab = "sampling";
       pulseEstimate();
-      setMessage(`预计从 ${estimatedSourceCount} 个视频生成 ${samplingEstimate.estimatedCount} 个候选图片`);
+      setMessage(`计划 ${samplingEstimate.estimatedCount} 张，已有 ${samplingEstimate.existingCount} 张，预计新增 ${samplingEstimate.estimatedNewCount} 张`);
     } catch (error) {
       setMessage(errorText(error), "error");
     } finally {
@@ -1275,18 +1565,23 @@
   async function runVideoSampling() {
     if (!selectedSource || selectedSource.kind !== "video") return;
     videoBusy = "正在执行视频抽帧";
+    samplingProgress = null;
+    samplingCompletion = null;
     try {
-      const result = applySourceGroup && !["valid_ranges", "change_triggered"].includes(samplingMode)
+      const groupRun = applySourceGroup && !["valid_ranges", "change_triggered"].includes(samplingMode);
+      const result = groupRun
         ? await invoke<SamplingExecutionResult>("run_source_group_sampling", { sourceGroup: selectedSource.sourceGroup, config: currentSamplingConfig() })
         : await invoke<SamplingExecutionResult>("run_video_sampling", { sourceId: selectedSource.id, config: currentSamplingConfig() });
       candidates = await invoke<CandidateImage[]>("get_candidates", { sourceId: selectedSource.id, offset: 0, limit: 10_000 });
       checkedCandidateIds = new Set();
       project = await invoke<ProjectSummary | null>("get_current_project");
+      samplingCompletion = { result, sourceScope: groupRun ? "source_group" : "current" };
       setMessage(`新增 ${result.created} 个，已有 ${result.existing} 个${result.failures.length ? `，失败 ${result.failures.length} 个` : ""}`, result.failures.length ? "error" : "info");
     } catch (error) {
       setMessage(errorText(error), "error");
     } finally {
       videoBusy = "";
+      samplingProgress = null;
     }
   }
 
@@ -1295,15 +1590,15 @@
     const candidateIds = scope === "selected" ? [...checkedCandidateIds] : null;
     const count = candidateIds?.length ?? candidates.length;
     if (count === 0) return;
-    const confirmed = await confirmDialog(
-      scope === "selected"
-        ? `将清空当前视频中选中的 ${count} 个候选帧，包括其中的人工或锁定候选。源视频不会被修改。`
-        : `将清空当前视频的全部 ${count} 个候选帧，包括人工和锁定候选。源视频不会被修改。`,
-      { title: scope === "selected" ? "清空选中候选" : "清空全部候选", kind: "warning" },
-    );
-    if (!confirmed) return;
-    videoBusy = scope === "selected" ? "正在清空选中候选" : "正在清空全部候选";
     try {
+      const confirmed = await confirmDialog(
+        scope === "selected"
+          ? `将清空当前视频中选中的 ${count} 个候选帧，包括其中的人工或锁定候选。源视频不会被修改。`
+          : `将清空当前视频的全部 ${count} 个候选帧，包括人工和锁定候选。源视频不会被修改。`,
+        { title: scope === "selected" ? "清空选中候选" : "清空全部候选", kind: "warning" },
+      );
+      if (!confirmed) return;
+      videoBusy = scope === "selected" ? "正在清空选中候选" : "正在清空全部候选";
       const result = await invoke<CandidateDeletionResult>("remove_candidates", {
         sourceId: selectedSource.id,
         candidateIds,
@@ -1334,7 +1629,6 @@
         sourceId: selectedSource.id, analysisFps, threshold: changeThreshold,
         minIntervalMs: Math.round(minChangeIntervalMs), maxIntervalMs: Math.round(maxChangeIntervalMs),
       });
-      samplingMode = "change_triggered";
       samplingEstimate = null;
       setMessage(`发现 ${changeAnalysis.suggestedTimestampsMs.length} 个建议时间点`);
     } catch (error) {
@@ -1351,6 +1645,12 @@
     if (sectionId === "export") inspectorTab = "export";
     if (sectionId === "review") void loadReviewWorkspace(true);
     if (sectionId === "sources" || inspectorTab === "sampling") selectedTilePreview = null;
+  }
+
+  function returnToProcessing() {
+    activeSection = "process";
+    inspectorTab = selectedSource?.kind === "video" ? "sampling" : selectedSource ? "roi" : "info";
+    selectedTilePreview = null;
   }
 
   function activateInspectorTab(tab: "info" | "sampling" | "roi" | "export") {
@@ -1406,13 +1706,18 @@
   }
 
   async function selectSource(sourceId: string) {
+    resetVideoPreview();
+    samplingCompletion = null;
     selectedSourceId = sourceId;
     await verifySource(sourceId, true, true);
     const source = sources.find((item) => item.id === sourceId);
     exportSourceScope = source?.kind === "image" ? "source_group" : "current";
     exportCandidateScope = "all";
     setExportContent(source?.kind === "video" ? "frames" : "tiles");
-    if (source?.kind === "video" && source.status === "online") await loadVideoWorkspace(sourceId);
+    if (source?.kind === "video" && source.status === "online") {
+      void prepareVideoPreview(sourceId);
+      await loadVideoWorkspace(sourceId);
+    }
     else resetVideoWorkspace();
     await loadRoiWorkspace(sourceId);
   }
@@ -1477,6 +1782,7 @@
   async function importPaths(paths: string[]) {
     if (!project || paths.length === 0) return;
     busyMessage = `正在检查 ${paths.length} 个导入入口`;
+    importProgress = null;
     importMenuOpen = false;
     try {
       const result = await invoke<ImportResult>("import_sources", { paths });
@@ -1487,6 +1793,7 @@
       setMessage(errorText(error), "error");
     } finally {
       busyMessage = "";
+      importProgress = null;
     }
   }
 
@@ -1588,6 +1895,12 @@
         else if (inspectorTab === "roi" && selectedSource) void saveRoi();
         return;
       }
+      if (activeSection === "review" && event.key === "Escape") {
+        event.preventDefault();
+        if (reviewComparisonGroupId) closeReviewComparison();
+        else returnToProcessing();
+        return;
+      }
       if (activeSection === "review" && commandKey && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) void redoReviewAction();
@@ -1607,7 +1920,10 @@
       if (editingText) return;
       if (activeSection === "review") {
         const key = event.key.toLowerCase();
-        if (key === "k") void applyReviewAction("keep");
+        if (reviewComparisonGroupId && (event.key === "+" || event.key === "=")) setReviewComparisonZoom(reviewComparisonZoom + 0.25);
+        else if (reviewComparisonGroupId && event.key === "-") setReviewComparisonZoom(reviewComparisonZoom - 0.25);
+        else if (reviewComparisonGroupId && event.key === "0") resetReviewComparisonTransform();
+        else if (key === "k") void applyReviewAction("keep");
         else if (key === "x") void applyReviewAction("exclude");
         else if (key === "r") void applyReviewAction("restore");
         else if (key === "l" && selectedReviewItem) void applyReviewAction(selectedReviewItem.locked ? "unlock" : "lock");
@@ -1658,7 +1974,7 @@
       if (event.key.toLowerCase() === "e" && selectedSource) {
         event.preventDefault();
         activateSection("export");
-      } else if (!isActiveVideo) {
+      } else if (!isActiveVideo || !previewUrl) {
         return;
       } else if (event.code === "Space") {
         event.preventDefault();
@@ -1690,11 +2006,30 @@
 
     let unlisten: (() => void) | undefined;
     let unlistenSourceRemovalProgress: (() => void) | undefined;
+    let unlistenImportProgress: (() => void) | undefined;
+    let unlistenVideoPreviewProgress: (() => void) | undefined;
+    let unlistenSamplingProgress: (() => void) | undefined;
+    let unlistenExportProgress: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
       void listen<SourceDeletionProgress>("source-removal-progress", (event) => {
         sourceRemovalProgress = event.payload;
         busyMessage = `正在移除项目来源 ${event.payload.completed} / ${event.payload.total}`;
       }).then((stop) => (unlistenSourceRemovalProgress = stop));
+      void listen<ImportProgress>("import-progress", (event) => {
+        importProgress = event.payload;
+        busyMessage = event.payload.phase;
+      }).then((stop) => (unlistenImportProgress = stop));
+      void listen<VideoPreviewProgress>("video-preview-progress", (event) => {
+        if (event.payload.sourceId !== selectedSourceId) return;
+        videoPreviewBusy = "正在生成兼容预览";
+        videoPreviewProgress = event.payload.percent;
+      }).then((stop) => (unlistenVideoPreviewProgress = stop));
+      void listen<OperationProgress>("sampling-progress", (event) => {
+        samplingProgress = event.payload;
+      }).then((stop) => (unlistenSamplingProgress = stop));
+      void listen<OperationProgress>("export-progress", (event) => {
+        exportProgress = event.payload;
+      }).then((stop) => (unlistenExportProgress = stop));
       void getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") dragActive = true;
         if (event.payload.type === "leave") dragActive = false;
@@ -1719,6 +2054,10 @@
     return () => {
       unlisten?.();
       unlistenSourceRemovalProgress?.();
+      unlistenImportProgress?.();
+      unlistenVideoPreviewProgress?.();
+      unlistenSamplingProgress?.();
+      unlistenExportProgress?.();
       window.clearInterval(statusTimer);
       window.removeEventListener("focus", verifySelected);
       sourcePanel.removeEventListener("contextmenu", showSourceContextMenu);
@@ -1764,7 +2103,7 @@
         {/if}
       </div>
       <button class="command" disabled={!isActiveVideo || !!videoBusy} onclick={estimateVideoSampling} title="估算当前视频抽帧数量"><CircleGauge size={16} /><span>预估</span></button>
-      <button class="command primary" disabled={!project || !!reviewBusy || !!busyMessage} onclick={runReviewAnalysis} title="运行质量与相似分析并进入审核"><Play size={16} fill="currentColor" /><span>快速处理</span></button>
+      <button class="command primary" disabled={!project || !!reviewBusy || !!busyMessage} onclick={runReviewAnalysis} title="对现有原图和视频候选运行质量与相似审核"><ListChecks size={16} /><span>质量审核</span></button>
       <button class="command" disabled={!selectedSource} onclick={() => activateSection("export")}><Download size={16} /><span>导出</span></button>
       <button class="icon-button" onclick={toggleTheme} title="切换主题" aria-label="切换主题">{#if theme === "light"}<Moon size={17} />{:else}<Sun size={17} />{/if}</button>
       <button class="icon-button" disabled title="应用设置将在后续里程碑接入" aria-label="设置"><Settings2 size={17} /></button>
@@ -1843,6 +2182,7 @@
         <select bind:value={reviewGroupFilter} aria-label="相似组筛选"><option value="all">全部相似组</option>{#each reviewGroupOptions as group}<option value={group}>{group.replace("sim-", "组 ")}</option>{/each}</select>
         <select bind:value={reviewSort} aria-label="审核排序"><option value="source">来源顺序</option><option value="sharpness">清晰度升序</option><option value="low_information">低信息量升序</option><option value="underexposed">欠曝比例升序</option><option value="overexposed">过曝比例升序</option><option value="resolution">分辨率升序</option></select>
         <span class="review-toolbar-spacer"></span>
+        <button class="review-back" onclick={returnToProcessing} title="返回抽帧和 ROI / 切图工作区" aria-label="返回处理"><ArrowLeft size={15} /></button>
         <button onclick={undoReviewAction} disabled={!reviewWorkspace?.canUndo || !!reviewBusy} title="撤销最近一次审核操作"><Undo2 size={14} />撤销</button>
         <button onclick={redoReviewAction} disabled={!reviewWorkspace?.canRedo || !!reviewBusy} title="重做已撤销的审核操作"><Redo2 size={14} />重做</button>
         <button onclick={() => applyReviewAction("keep")} disabled={!checkedReviewKeys.size && !selectedReviewKey}><Check size={14} />保留</button>
@@ -1852,6 +2192,8 @@
       <div class="review-summary-strip">
         <span><strong>{reviewWorkspace?.summary.keep ?? 0}</strong> 保留</span>
         <span class="suggested"><strong>{reviewWorkspace?.summary.suggestedExclude ?? 0}</strong> 建议排除</span>
+        <button class="review-exclude-suggested" onclick={() => applyReviewAction("exclude", suggestedReviewKeys)} disabled={!suggestedReviewKeys.length || !!reviewBusy} title="将当前项目中所有建议排除项标记为人工排除"><X size={13} />一键排除全部建议</button>
+        <button class="review-export-eligible" onclick={openReviewedExport} disabled={!selectedReviewItem || !!reviewBusy} title="将当前审核项所属素材交接到导出页，并跳过人工排除项"><Download size={13} />导出审核后保留</button>
         <span class="excluded"><strong>{reviewWorkspace?.summary.manuallyExcluded ?? 0}</strong> 人工排除</span>
         <span class="warning"><strong>{reviewWorkspace?.summary.warning ?? 0}</strong> 警告</span>
         <span><strong>{reviewWorkspace?.summary.locked ?? 0}</strong> 锁定</span>
@@ -1862,6 +2204,67 @@
           <div class="review-empty"><LoaderCircle size={28} class="spinning" /><strong>{reviewBusy}</strong><span>自动建议不会覆盖已有人工决定。</span></div>
         {:else if !reviewWorkspace}
           <div class="review-empty"><ScanLine size={30} /><strong>尚未生成审核结果</strong><span>运行质量与相似分析后在这里确认建议排除项。</span><button class="primary" onclick={runReviewAnalysis}><Play size={14} fill="currentColor" />开始分析</button></div>
+        {:else if reviewComparisonGroupId && reviewComparisonItems.length}
+          <div class="review-comparison-shell">
+            <div class="review-comparison-toolbar">
+              <button class="comparison-return" onclick={closeReviewComparison}><ArrowLeft size={14} />返回网格</button>
+              <div class="comparison-title">
+                <Columns3 size={16} />
+                <div><strong>{reviewComparisonGroupId.replace("sim-", "相似组 ")}</strong><span>{reviewComparisonItems.length} 张图片同步对比</span></div>
+              </div>
+              {#if reviewComparisonItems.some((item) => item.lockedConflict)}
+                <span class="comparison-conflict"><AlertCircle size={13} />多张锁定，需确认代表图</span>
+              {/if}
+              <span class="review-toolbar-spacer"></span>
+              <div class="comparison-zoom" aria-label="同步缩放控制">
+                <button onclick={() => setReviewComparisonZoom(reviewComparisonZoom - 0.25)} disabled={reviewComparisonZoom <= 1} title="缩小全部图片" aria-label="缩小全部图片"><ZoomOut size={14} /></button>
+                <input type="range" min="1" max="4" step="0.25" value={reviewComparisonZoom} oninput={(event) => setReviewComparisonZoom(Number(event.currentTarget.value))} aria-label="同步缩放倍率" />
+                <button onclick={() => setReviewComparisonZoom(reviewComparisonZoom + 0.25)} disabled={reviewComparisonZoom >= 4} title="放大全部图片" aria-label="放大全部图片"><ZoomIn size={14} /></button>
+                <strong>{reviewComparisonZoom.toFixed(2)}×</strong>
+                <button onclick={resetReviewComparisonTransform} disabled={reviewComparisonZoom === 1 && reviewComparisonPanX === 0 && reviewComparisonPanY === 0}>复位</button>
+              </div>
+              <button onclick={() => applyReviewAction("keep", reviewComparisonItems.map((item) => item.assetKey))} disabled={!!reviewBusy}><Check size={14} />整组保留</button>
+              <button class="comparison-exclude" onclick={() => applyReviewAction("exclude", reviewComparisonCheckedKeys)} disabled={!reviewComparisonCheckedKeys.length || !!reviewBusy}><X size={14} />排除选中 {reviewComparisonCheckedKeys.length || ""}</button>
+            </div>
+            <div class="review-comparison-list">
+              {#each reviewComparisonItems as item}
+                {@const status = reviewEffectiveStatus(item)}
+                <article class="review-comparison-member" class:selected={selectedReviewKey === item.assetKey} class:representative={item.representative} class:excluded={status === "excluded"}>
+                  <header>
+                    <label><input type="checkbox" checked={checkedReviewKeys.has(item.assetKey)} onchange={(event) => toggleReviewChecked(item.assetKey, event.currentTarget.checked)} aria-label={`选择 ${item.displayName}`} /></label>
+                    <button class="comparison-member-name" onclick={() => selectReviewItem(item)} title={item.displayName}><strong>{item.displayName}</strong><span>{item.sourceGroup}</span></button>
+                    <span class:warning={status === "suggested" || status === "warning"} class:danger={status === "excluded" || status === "error"}>{reviewStatusLabel(item)}</span>
+                  </header>
+                  <button
+                    class="comparison-viewport"
+                    class:dragging={!!reviewComparisonDrag}
+                    class:zoomed={reviewComparisonZoom > 1}
+                    onclick={() => selectReviewItem(item)}
+                    onpointerdown={startReviewComparisonPan}
+                    onpointermove={moveReviewComparisonPan}
+                    onpointerup={endReviewComparisonPan}
+                    onpointercancel={endReviewComparisonPan}
+                    onwheel={zoomReviewComparison}
+                    title={reviewComparisonZoom > 1 ? "拖动以同步平移全部图片；滚轮同步缩放" : "滚轮或工具栏同步放大全部图片"}
+                  >
+                    <img src={convertFileSrc(item.imagePath)} alt={item.displayName} draggable="false" style:transform={`translate(${reviewComparisonPanX}px, ${reviewComparisonPanY}px) scale(${reviewComparisonZoom})`} />
+                    {#if item.representative}<span class="comparison-representative"><Check size={12} />代表图</span>{/if}
+                    {#if item.locked}<span class="comparison-locked"><Lock size={12} />已锁定</span>{/if}
+                  </button>
+                  <footer>
+                    <div class="comparison-metrics">
+                      <span><small>相似分数</small><strong>{item.similarityScore !== null ? item.similarityScore.toFixed(4) : "--"}</strong></span>
+                      <span><small>清晰度</small><strong>{item.metrics?.sharpness.toFixed(1) ?? "--"}</strong></span>
+                      <span><small>尺寸</small><strong>{item.metrics ? `${item.metrics.width}×${item.metrics.height}` : "--"}</strong></span>
+                      <span><small>时间点</small><strong>{item.videoOffsetMs !== null ? formatTimestamp(item.videoOffsetMs) : "原图"}</strong></span>
+                    </div>
+                    {#if item.lockedConflict}<span class="comparison-member-conflict"><AlertCircle size={12} />锁定冲突</span>{/if}
+                    <button class="comparison-representative-action" onclick={() => applyReviewAction("make_representative", [item.assetKey])} disabled={item.representative || !!reviewBusy}><Check size={13} />{item.representative ? "当前代表图" : "设为代表图"}</button>
+                  </footer>
+                </article>
+              {/each}
+            </div>
+          </div>
         {:else if filteredReviewItems.length === 0}
           <div class="review-empty"><Search size={28} /><strong>当前筛选没有结果</strong><span>调整状态、来源或相似组筛选。</span></div>
         {:else}
@@ -1870,7 +2273,7 @@
               {@const status = reviewEffectiveStatus(item)}
               <div class="review-card" class:selected={selectedReviewKey === item.assetKey} class:suggested={status === "suggested"} class:excluded={status === "excluded"} class:warning={status === "warning"} class:error={status === "error"} class:representative={item.representative}>
                 <label class="review-checkbox"><input type="checkbox" checked={checkedReviewKeys.has(item.assetKey)} onchange={(event) => toggleReviewChecked(item.assetKey, event.currentTarget.checked)} aria-label={`选择 ${item.displayName}`} /></label>
-                <button class="review-image" onclick={() => selectReviewItem(item)} ondblclick={() => item.similarityGroupId && (reviewGroupFilter = item.similarityGroupId)} title={`${item.displayName} · ${reviewStatusLabel(item)}`}>
+                <button class="review-image" onclick={() => selectReviewItem(item)} ondblclick={() => openReviewComparison(item)} title={`${item.displayName} · 来源组 ${item.sourceGroup} · ${reviewStatusLabel(item)}${item.similarityGroupId ? " · 双击并排对比" : ""}`}>
                   <img src={reviewThumbnailUrl(item)} alt="" />
                   {#if status === "suggested"}<span class="review-wash">建议排除</span>{/if}
                   {#if status === "excluded"}<span class="review-wash manual">人工排除</span>{/if}
@@ -1880,7 +2283,7 @@
                   {#if item.representative}<span class="representative" title="相似组代表图"><Check size={11} /></span>{/if}
                   {#if item.automaticReasons.length}<span class="quality" title={item.automaticReasons.join("；")}><AlertCircle size={11} /></span>{/if}
                 </div>
-                <button class="review-caption" onclick={() => selectReviewItem(item)}><strong>{item.sourceIdentifier}</strong><span>{item.videoOffsetMs !== null ? formatTimestamp(item.videoOffsetMs) : item.displayName}</span><small>{reviewStatusLabel(item)}{item.similarityGroupId ? ` · ${item.similarityGroupId.replace("sim-", "组 ")}` : ""}</small></button>
+                <button class="review-caption" onclick={() => selectReviewItem(item)}><strong>{item.displayName}</strong><span>{item.sourceGroup}</span><small>{reviewStatusLabel(item)}{item.similarityGroupId ? ` · ${item.similarityGroupId.replace("sim-", "组 ")}` : ""}</small></button>
               </div>
             {/each}
           </div>
@@ -1924,14 +2327,35 @@
               bind:this={videoElement}
               class="source-preview video-preview"
               src={previewUrl}
+              poster={selectedSource.thumbnailPath ? thumbnailUrl(selectedSource) : undefined}
               preload="auto"
-              ontimeupdate={(event) => { currentTimeMs = Math.round(event.currentTarget.currentTime * 1_000); jumpTime = formatTimestamp(currentTimeMs); }}
-              onplay={() => (isPlaying = true)}
+              ontimeupdate={handleVideoTimeUpdate}
+              onseeked={handleVideoSeeked}
+              oncanplay={handleVideoReady}
+              onplaying={handleVideoReady}
+              onplay={() => { isPlaying = true; videoPreviewError = ""; }}
               onpause={() => (isPlaying = false)}
               onended={() => (isPlaying = false)}
-              onloadedmetadata={() => applyPlaybackRate(playbackRate)}
+              onloadedmetadata={handleVideoLoadedMetadata}
+              onerror={handleVideoError}
               onclick={togglePlayback}
             ></video>
+            {#if videoPreviewBusy}
+              <div class="video-preview-overlay" role="status" onpointerdown={(event) => event.stopPropagation()}>
+                <LoaderCircle size={24} class="spinning" />
+                <strong>{videoPreviewBusy}</strong>
+                <span>{videoPreviewProgress > 0 ? `${videoPreviewProgress}%` : "正在读取媒体信息"}</span>
+                <div class="video-preview-progress"><span style:width={`${videoPreviewProgress}%`}></span></div>
+                <small>仅生成项目缓存，原视频不会被修改</small>
+              </div>
+            {:else if videoPreviewError}
+              <div class="video-preview-overlay error" role="alert" onpointerdown={(event) => event.stopPropagation()}>
+                <AlertCircle size={24} />
+                <strong>视频预览不可用</strong>
+                <span>{videoPreviewError}</span>
+                <button onclick={() => selectedSource && prepareVideoPreview(selectedSource.id, true)}>重新生成兼容预览</button>
+              </div>
+            {/if}
           {/if}
           {#if inspectorTab === "roi" || activeSection === "export"}
             <div class="roi-layer" aria-label="ROI 与切片坐标">
@@ -1976,12 +2400,12 @@
             <button class="candidate-marker" class:pinned={candidate.pinned} style:left={`${candidate.videoOffsetMs / Math.max(selectedSource?.durationMs ?? 1, 1) * 100}%`} onclick={() => seekTo(candidate.videoOffsetMs)} title={`${formatTimestamp(candidate.videoOffsetMs)} ${candidate.selectionMethod}`}></button>
           {/each}
           {#if markInMs !== null}<span class="in-marker" style:left={`${markInMs / Math.max(selectedSource?.durationMs ?? 1, 1) * 100}%`}></span>{/if}
-          <input type="range" min="0" max={selectedSource?.durationMs ?? 0} step="1" value={currentTimeMs} oninput={(event) => seekTo(Number(event.currentTarget.value))} aria-label="视频时间轴" />
+          <input type="range" min="0" max={selectedSource?.durationMs ?? 0} step="1" value={currentTimeMs} disabled={!previewUrl} oninput={(event) => seekTo(Number(event.currentTarget.value))} aria-label="视频时间轴" />
         </div>
         <div class="transport-bar">
-          <button onclick={() => stepFrame(-1)} disabled={!frameTimestamps.length || !!videoBusy} title="上一帧" aria-label="上一帧"><SkipBack size={15} /></button>
-          <button class="play-control" onclick={togglePlayback} disabled={!!videoBusy} title={isPlaying ? "暂停" : "播放"} aria-label={isPlaying ? "暂停" : "播放"}>{#if isPlaying}<Pause size={15} fill="currentColor" />{:else}<Play size={15} fill="currentColor" />{/if}</button>
-          <button onclick={() => stepFrame(1)} disabled={!frameTimestamps.length || !!videoBusy} title="下一帧" aria-label="下一帧"><SkipForward size={15} /></button>
+          <button onclick={() => stepFrame(-1)} disabled={!previewUrl || activeVideoFrameRate <= 0 || !!videoBusy} title="上一帧" aria-label="上一帧"><SkipBack size={15} /></button>
+          <button class="play-control" onclick={togglePlayback} disabled={!previewUrl || !!videoBusy} title={isPlaying ? "暂停" : "播放"} aria-label={isPlaying ? "暂停" : "播放"}>{#if isPlaying}<Pause size={15} fill="currentColor" />{:else}<Play size={15} fill="currentColor" />{/if}</button>
+          <button onclick={() => stepFrame(1)} disabled={!previewUrl || activeVideoFrameRate <= 0 || !!videoBusy} title="下一帧" aria-label="下一帧"><SkipForward size={15} /></button>
           <strong class="mono transport-time">{formatTimestamp(currentTimeMs)}</strong>
           <div class="speed-control" aria-label="播放速度">{#each [0.25, 0.5, 1, 2] as rate}<button class:active={playbackRate === rate} onclick={() => applyPlaybackRate(rate)}>{rate}x</button>{/each}</div>
           <label class="jump-control"><input bind:value={jumpTime} onkeydown={(event) => event.key === "Enter" && jumpToInput()} aria-label="跳转时间" /><button onclick={jumpToInput} title="跳转"><Timer size={14} /></button></label>
@@ -2056,11 +2480,24 @@
         <div class="subsection-heading"><span>阈值分布</span><select class="subsection-select" bind:value={reviewQualityMetric} aria-label="质量分布指标"><option value="sharpness">清晰度</option><option value="low_information">低信息量</option><option value="underexposed">欠曝比例</option><option value="overexposed">过曝比例</option><option value="resolution">分辨率</option></select></div>
         {#if reviewWorkspace && reviewMetricValues.length}
           <div class="quality-distribution" aria-label={`${reviewMetricLabel(reviewQualityMetric)}分布`}>
-            <div class="quality-bars">{#each reviewHistogram as bucket, index}<span class:threshold-near={Math.abs((index + 0.5) / 12 * 100 - reviewThresholdPosition) < 9} style:height={`${Math.max(4, bucket.ratio * 100)}%`} title={`${bucket.count} 张`}></span>{/each}<i style:left={`${reviewThresholdPosition}%`}></i></div>
-            <div class="quality-scale"><span>{formatReviewMetric(reviewMetricRange.min, reviewQualityMetric)}</span><strong>阈值 {formatReviewMetric(reviewMetricThreshold, reviewQualityMetric)}</strong><span>{formatReviewMetric(reviewMetricRange.max, reviewQualityMetric)}</span></div>
+            <div class="quality-chart-caption"><span>横轴：{reviewMetricLabel(reviewQualityMetric)}数值</span><span>纵轴：图片数量</span></div>
+            <div class="quality-chart">
+              <div class="quality-y-axis" aria-hidden="true"><span>{reviewHistogramMax}</span><span>{Math.ceil(reviewHistogramMax / 2)}</span><span>0</span></div>
+              <div class="quality-plot">
+                <div class="quality-bars">{#each reviewHistogram as bucket, index}<span class:threshold-near={Math.abs((index + 0.5) / 12 * 100 - reviewThresholdPosition) < 9} style:height={`${bucket.count ? Math.max(4, bucket.ratio * 100) : 0}%`} title={`${formatReviewMetric(bucket.start, reviewQualityMetric)} - ${formatReviewMetric(bucket.end, reviewQualityMetric)}：${bucket.count} 张`}></span>{/each}<i style:left={`${reviewThresholdPosition}%`} title={`阈值 ${formatReviewMetric(reviewMetricThreshold, reviewQualityMetric)}`}></i></div>
+                <div class="quality-scale"><span>{formatReviewMetric(reviewMetricRange.min, reviewQualityMetric)}</span><strong>红线：阈值 {formatReviewMetric(reviewMetricThreshold, reviewQualityMetric)}</strong><span>{formatReviewMetric(reviewMetricRange.max, reviewQualityMetric)}</span></div>
+              </div>
+            </div>
+            <p class="quality-threshold-note">每根柱代表一个数值区间内的图片数量；鼠标悬停柱子可查看区间与数量。</p>
           </div>
-          <div class="quality-impact"><span>按当前阈值预计影响</span><strong>{reviewEstimatedImpact}</strong><small>张 · 调整后需运行分析才会写入建议</small></div>
-          <div class="threshold-samples"><span>阈值附近样本</span>{#each reviewThresholdSamples as sample}<button onclick={() => selectReviewItem(sample)}><span>{sample.sourceIdentifier}</span><strong>{formatReviewMetric(reviewMetricValue(sample, reviewQualityMetric), reviewQualityMetric)}</strong></button>{/each}</div>
+          <div class="quality-impact"><span>按当前阈值预计影响</span><strong>{reviewEstimatedImpact}</strong><small>张 · {reviewMetricGuide(reviewQualityMetric).threshold} 调整后需重新运行分析才会写入建议。</small></div>
+          <details class="quality-guide">
+            <summary>查看“{reviewMetricLabel(reviewQualityMetric)}”的含义</summary>
+            <p>{reviewMetricGuide(reviewQualityMetric).summary}</p>
+            <p>{reviewMetricGuide(reviewQualityMetric).threshold}</p>
+            <p>这是辅助筛选指标，不会自动删除图片；请结合预览确认后再排除。</p>
+          </details>
+          <div class="threshold-samples"><span>阈值附近样本</span>{#each reviewThresholdSamples as sample}<button onclick={() => selectReviewItem(sample)} title={`${sample.displayName} · 来源组 ${sample.sourceGroup}`}><span class="threshold-sample-name"><strong>{sample.displayName}</strong><small>{sample.sourceGroup}</small></span><strong class="threshold-sample-value">{formatReviewMetric(reviewMetricValue(sample, reviewQualityMetric), reviewQualityMetric)}</strong></button>{/each}</div>
         {:else}<span class="range-empty">运行分析后显示指标分布</span>{/if}
         <div class="subsection-heading"><span>视觉相似</span><ScanLine size={14} /></div>
         <label class="field-row"><span>比较范围</span><select bind:value={reviewSimilarityScope}><option value="source">同一来源</option><option value="source_group">同一来源组</option><option value="project">整个项目</option></select></label>
@@ -2087,6 +2524,7 @@
           <div class="review-detail-actions">
             <button onclick={() => applyReviewAction(selectedReviewItem.locked ? "unlock" : "lock", [selectedReviewItem.assetKey])}>{#if selectedReviewItem.locked}<Unlock size={13} />解锁{:else}<Lock size={13} />锁定{/if}</button>
             <button onclick={() => applyReviewAction("make_representative", [selectedReviewItem.assetKey])} disabled={!selectedReviewItem.similarityGroupId || selectedReviewItem.representative}><Check size={13} />设为代表图</button>
+            {#if selectedReviewItem.similarityGroupId}<button class="wide" onclick={() => openReviewComparison(selectedReviewItem)}><Columns3 size={13} />并排对比同组图片</button>{/if}
           </div>
         {:else}<span class="range-empty">从审核网格选择一个项目查看测量值</span>{/if}
       </div>
@@ -2099,13 +2537,13 @@
     </div>
     {#if inspectorTab === "export" && selectedSource}
       <section class="sampling-heading">
-        <div><span class="eyebrow">基础导出</span><h2>{selectedSource.fileName}</h2></div>
+        <div><span class="eyebrow">候选与切片导出</span><h2>{selectedSource.fileName}</h2></div>
         <Download size={17} />
       </section>
       {#if exportBusy}<div class="video-busy"><LoaderCircle size={14} class="spinning" /><span>{exportBusy}</span></div>{/if}
       <div class="sampling-panel export-panel">
         <div class="field-row export-mode-row"><span>导出内容</span><div class="segmented-control" aria-label="导出内容">
-          <button class:active={exportContent === "frames"} onclick={() => setExportContent("frames")} title={selectedSource.kind === "video" ? "导出视频抽帧候选原图" : "导出当前图片原图"}><Film size={13} />{selectedSource.kind === "video" ? "抽帧" : "原图"}</button>
+          <button class:active={exportContent === "frames"} onclick={() => setExportContent("frames")} title={selectedSource.kind === "video" ? "导出视频候选原图" : "导出当前图片原图"}><Film size={13} />{selectedSource.kind === "video" ? "候选原图" : "原图"}</button>
           <button class:active={exportContent === "tiles"} onclick={() => setExportContent("tiles")}><LayoutGrid size={13} />ROI 切片</button>
         </div></div>
         <div class="field-row export-mode-row"><span>导出范围</span><div class="segmented-control" aria-label="导出范围">
@@ -2118,6 +2556,13 @@
             <button class:active={exportCandidateScope === "selected"} disabled={!selectedCandidateId} onclick={() => setExportCandidateScope("selected")}><ImageIcon size={13} />当前帧</button>
           </div></div>
         {/if}
+        <div class="field-row export-mode-row"><span>审核范围</span><div class="segmented-control" aria-label="审核范围">
+          <button class:active={exportReviewScope === "eligible"} onclick={() => setExportReviewScope("eligible")}><Check size={13} />审核后保留</button>
+          <button class:active={exportReviewScope === "all"} onclick={() => setExportReviewScope("all")}><Images size={13} />全部候选</button>
+        </div></div>
+        <div class="export-review-note" class:risk={exportReviewScope === "all"}>
+          {#if exportReviewScope === "eligible"}<Check size={13} /><span>跳过人工排除项；未审核素材仍可正常导出。</span>{:else}<AlertCircle size={13} /><span>忽略审核决定，将包含已人工排除的候选。</span>{/if}
+        </div>
         <label class="field-row"><span>导出目录</span><button class="inline-picker" onclick={chooseExportDirectory}><FolderOutput size={14} /><span>{exportDirectory || "选择目录"}</span></button></label>
         <label class="field-row"><span>命名模板</span><input bind:value={namingTemplate} oninput={() => (exportPlan = null)} /></label>
         <label class="field-row"><span>图片格式</span><select bind:value={exportFormat} onchange={() => (exportPlan = null)}>
@@ -2144,11 +2589,11 @@
     {:else if inspectorTab === "sampling" && selectedSource?.kind === "video"}
       <section class="sampling-heading">
         <div><span class="eyebrow">视频人工筛查</span><h2>{selectedSource.fileName}</h2></div>
-        <span class="mono">{frameTimestamps.length} 帧</span>
+        <span class="mono">{estimatedVideoFrameCount ? `约 ${estimatedVideoFrameCount.toLocaleString()} 帧` : "帧率未知"}</span>
       </section>
       {#if videoBusy}<div class="video-busy"><LoaderCircle size={14} class="spinning" /><span>{videoBusy}</span></div>{/if}
       <div class="sampling-panel">
-        <label class="field-row"><span>抽帧模式</span><select bind:value={samplingMode} onchange={() => (samplingEstimate = null)}>
+        <label class="field-row"><span>抽帧模式</span><select bind:value={samplingMode} onchange={(event) => { samplingEstimate = null; if (event.currentTarget.value !== "change_triggered") changeChartExpanded = false; }}>
           <option value="fixed_interval">固定时间间隔</option><option value="frame_interval">固定帧间隔</option>
           <option value="target_count">目标数量</option><option value="valid_ranges">有效片段</option>
           <option value="change_triggered">画面变化触发</option>
@@ -2180,39 +2625,48 @@
           {#if videoSelections.length === 0}<span class="range-empty">使用时间轴入点和出点添加片段</span>{/if}
         </div>
 
-        <div class="subsection-heading"><span>画面变化</span><div class="heading-tools"><Activity size={14} /><button onclick={() => (changeChartExpanded = true)} disabled={!changeAnalysis} title="放大变化曲线" aria-label="放大变化曲线"><Maximize2 size={13} /></button></div></div>
-        <div class="analysis-grid">
-          <label><span>分析 FPS</span><input type="number" min="0.1" max="30" step="0.1" bind:value={analysisFps} /></label>
-          <label><span>阈值</span><input type="number" min="0" max="1" step="0.01" bind:value={changeThreshold} /></label>
-          <label><span>最小间隔 ms</span><input type="number" min="1" bind:value={minChangeIntervalMs} /></label>
-          <label><span>最大间隔 ms</span><input type="number" min="1" bind:value={maxChangeIntervalMs} /></label>
-        </div>
-        <button class="analysis-command" onclick={analyzeVideoChanges} disabled={!!videoBusy}><Activity size={14} />分析画面变化</button>
-        {#if changeAnalysis}
-          <div class="change-chart">
-            <svg viewBox="0 0 320 104" role="img" aria-label="相邻分析帧的归一化画面变化分数，横轴为视频时间，纵轴为变化分数">
-              <g class="chart-grid">
-                <line x1="42" y1="10" x2="308" y2="10" /><line x1="42" y1="40" x2="308" y2="40" /><line x1="42" y1="70" x2="308" y2="70" />
-              </g>
-              <g class="chart-axes"><line x1="42" y1="10" x2="42" y2="70" /><line x1="42" y1="70" x2="308" y2="70" /></g>
-              <line class="chart-threshold" x1="42" y1={changeThresholdY} x2="308" y2={changeThresholdY} />
-              <text class="chart-threshold-label" x="304" y={Math.max(9, changeThresholdY - 3)} text-anchor="end">阈值 {changeThreshold.toFixed(2)}</text>
-              <polyline points={changePolyline} />
-              <g class="chart-labels">
-                <text x="37" y="73" text-anchor="end">0</text><text x="37" y="43" text-anchor="end">{(changeChartMaxScore / 2).toFixed(2)}</text><text x="37" y="13" text-anchor="end">{changeChartMaxScore.toFixed(2)}</text>
-                <text x="42" y="83" text-anchor="middle">0:00</text><text x="175" y="83" text-anchor="middle">{formatChartTime(changeChartMaxTimestamp / 2)}</text><text x="308" y="83" text-anchor="middle">{formatChartTime(changeChartMaxTimestamp)}</text>
-                <text class="chart-axis-title" x="175" y="98" text-anchor="middle">视频时间</text><text class="chart-axis-title" x="9" y="40" text-anchor="middle" transform="rotate(-90 9 40)">变化分数</text>
-              </g>
-            </svg>
-            <span>相邻分析帧的归一化视觉差异 · {changeAnalysis.suggestedTimestampsMs.length} 个建议时间点</span>
+        {#if samplingMode === "change_triggered"}
+          <div class="subsection-heading"><span>画面变化</span><div class="heading-tools"><Activity size={14} /><button class:action-attention={!!changeAnalysis} onclick={() => (changeChartExpanded = true)} disabled={!changeAnalysis} title="放大变化曲线" aria-label="放大变化曲线"><Maximize2 size={13} /></button></div></div>
+          <div class="analysis-grid">
+            <label><span>分析 FPS</span><input type="number" min="0.1" max="30" step="0.1" bind:value={analysisFps} /></label>
+            <label><span>阈值</span><input type="number" min="0" max="1" step="0.01" bind:value={changeThreshold} /></label>
+            <label><span>最小间隔 ms</span><input type="number" min="1" bind:value={minChangeIntervalMs} /></label>
+            <label><span>最大间隔 ms</span><input type="number" min="1" bind:value={maxChangeIntervalMs} /></label>
           </div>
+          <button class="analysis-command" class:action-attention={!changeAnalysis && !videoBusy} onclick={analyzeVideoChanges} disabled={!!videoBusy}><Activity size={14} />分析画面变化</button>
+          {#if changeAnalysis}
+            <div class="change-chart">
+              <svg viewBox="0 0 320 104" role="img" aria-label="相邻分析帧的归一化画面变化分数，横轴为视频时间，纵轴为变化分数">
+                <g class="chart-grid">
+                  <line x1="42" y1="10" x2="308" y2="10" /><line x1="42" y1="40" x2="308" y2="40" /><line x1="42" y1="70" x2="308" y2="70" />
+                </g>
+                <g class="chart-axes"><line x1="42" y1="10" x2="42" y2="70" /><line x1="42" y1="70" x2="308" y2="70" /></g>
+                <line class="chart-threshold" x1="42" y1={changeThresholdY} x2="308" y2={changeThresholdY} />
+                <text class="chart-threshold-label" x="304" y={Math.max(9, changeThresholdY - 3)} text-anchor="end">阈值 {changeThreshold.toFixed(2)}</text>
+                <polyline points={changePolyline} />
+                <g class="chart-labels">
+                  <text x="37" y="73" text-anchor="end">0</text><text x="37" y="43" text-anchor="end">{(changeChartMaxScore / 2).toFixed(2)}</text><text x="37" y="13" text-anchor="end">{changeChartMaxScore.toFixed(2)}</text>
+                  <text x="42" y="83" text-anchor="middle">0:00</text><text x="175" y="83" text-anchor="middle">{formatChartTime(changeChartMaxTimestamp / 2)}</text><text x="308" y="83" text-anchor="middle">{formatChartTime(changeChartMaxTimestamp)}</text>
+                  <text class="chart-axis-title" x="175" y="98" text-anchor="middle">视频时间</text><text class="chart-axis-title" x="9" y="40" text-anchor="middle" transform="rotate(-90 9 40)">变化分数</text>
+                </g>
+              </svg>
+              <span>相邻分析帧的归一化视觉差异 · {changeAnalysis.suggestedTimestampsMs.length} 个建议时间点</span>
+            </div>
+          {/if}
         {/if}
 
         {#if samplingEstimate}
-          <div class="estimate-result" class:estimate-pulse={estimatePulse}><span>{estimatedSourceCount} 个视频预计候选</span><strong>{samplingEstimate.estimatedCount} 张</strong><small>{samplingEstimate.timestampsMs.length ? samplingEstimate.timestampsMs.slice(0, 3).map(formatTimestamp).join(" · ") : `来源组 ${selectedSource.sourceGroup}`}</small></div>
+          <div class="estimate-result" class:estimate-pulse={estimatePulse}><span>{estimatedSourceCount} 个视频预计新增</span><strong>{samplingEstimate.estimatedNewCount} 张</strong><small>计划 {samplingEstimate.estimatedCount} · 已有 {samplingEstimate.existingCount}{samplingEstimate.timestampsMs.length ? ` · ${samplingEstimate.timestampsMs.slice(0, 3).map(formatTimestamp).join(" · ")}` : ` · 来源组 ${selectedSource.sourceGroup}`}</small></div>
+        {/if}
+        {#if samplingCompletion}
+          <div class="sampling-handoff">
+            <div class="sampling-handoff-heading"><Check size={17} /><div><strong>候选图片已准备</strong><span>新增 {samplingCompletion.result.created} · 已有 {samplingCompletion.result.existing} · 失败 {samplingCompletion.result.failures.length}</span></div></div>
+            <p>下一步可以先运行质量与相似审核，再只导出保留项；也可以跳过审核直接导出全部候选。</p>
+            <div><button class="primary" onclick={reviewAfterSampling}><ListChecks size={14} />先审核再导出</button><button onclick={openDirectExportAfterSampling}><Download size={14} />直接导出</button></div>
+          </div>
         {/if}
       </div>
-      <div class="sampling-actions"><button onclick={estimateVideoSampling} disabled={!!videoBusy}><CircleGauge size={14} />预估</button><button class="primary" onclick={runVideoSampling} disabled={!!videoBusy || (samplingMode === "change_triggered" && !changeAnalysis)}><Play size={14} fill="currentColor" />执行抽帧</button></div>
+      <div class="sampling-actions"><button onclick={estimateVideoSampling} disabled={!!videoBusy || (samplingMode === "change_triggered" && !changeAnalysis)}><CircleGauge size={14} />预估</button><button class="primary" onclick={runVideoSampling} disabled={!!videoBusy || (samplingMode === "change_triggered" && !changeAnalysis)}><Play size={14} fill="currentColor" />执行抽帧</button></div>
     {:else if inspectorTab === "roi" && selectedSource}
       <section class="sampling-heading">
         <div><span class="eyebrow">ROI 与固定尺寸切图</span><h2>{selectedSource.fileName}</h2></div>
@@ -2303,7 +2757,7 @@
     <div class="shortcut-preview" aria-label="当前工作区快捷键">
       {#each shortcutHints as hint}<span><kbd>{hint[0]}</kbd>{hint[1]}</span>{/each}
     </div>
-    <div class="status-right"><span>源素材 {project?.sourceCount ?? 0}</span><span class:estimate-status={estimatePulse}>{estimatePulse && samplingEstimate ? `预计候选 ${samplingEstimate.estimatedCount}` : `候选 ${project?.candidateCount ?? 0}`}</span><span>任务 0</span></div>
+    <div class="status-right"><span>源素材 {project?.sourceCount ?? 0}</span><span class:estimate-status={estimatePulse}>{estimatePulse && samplingEstimate ? `预计新增 ${samplingEstimate.estimatedNewCount}` : `候选 ${project?.candidateCount ?? 0}`}</span><span>任务 0</span></div>
   </footer>
 
   {#if dragActive}<div class="drop-overlay"><FolderInput size={38} /><strong>{project ? "松开以导入源素材" : "请先创建或打开项目"}</strong><span>支持文件和递归目录</span></div>{/if}
@@ -2314,6 +2768,27 @@
       <p>仅清理项目引用与缓存，原始图片和视频保持不变。</p>
       <div class="source-progress-track"><span style:width={`${sourceRemovalProgress.total ? sourceRemovalProgress.completed / sourceRemovalProgress.total * 100 : 0}%`}></span></div>
       <footer><span>{sourceRemovalProgress.completed} / {sourceRemovalProgress.total}</span><span>来源 {sourceRemovalProgress.deleted} · 候选 {sourceRemovalProgress.candidateDeleted}</span></footer>
+    </section>
+  {:else if importProgress}
+    <section class="source-removal-progress" role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class="spinning" /><strong>{importProgress.phase}</strong></header>
+      <p>正在建立项目引用和预览缩略图；原始文件保持不变。</p>
+      <div class="source-progress-track"><span style:width={`${importProgress.total ? importProgress.completed / importProgress.total * 100 : 0}%`}></span></div>
+      <footer><span>{importProgress.completed} / {importProgress.total}</span><span>新增 {importProgress.imported} · 更新 {importProgress.updated} · 忽略 {importProgress.unsupported} · 失败 {importProgress.failed}</span></footer>
+    </section>
+  {:else if samplingProgress}
+    <section class="source-removal-progress" role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class="spinning" /><strong>{samplingProgress.phase}</strong></header>
+      <p>候选图片写入项目缓存；原视频保持不变。</p>
+      <div class="source-progress-track"><span style:width={`${samplingProgress.total ? samplingProgress.completed / samplingProgress.total * 100 : 0}%`}></span></div>
+      <footer><span>{samplingProgress.completed} / {samplingProgress.total}</span><span>新增 {samplingProgress.succeeded} · 已有 {samplingProgress.existing} · 失败 {samplingProgress.failed}</span></footer>
+    </section>
+  {:else if exportProgress}
+    <section class="source-removal-progress" role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class="spinning" /><strong>{exportProgress.phase}</strong></header>
+      <p>正在写入图片与来源追溯清单。</p>
+      <div class="source-progress-track"><span style:width={`${exportProgress.total ? exportProgress.completed / exportProgress.total * 100 : 0}%`}></span></div>
+      <footer><span>{exportProgress.completed} / {exportProgress.total}</span><span>写入 {exportProgress.succeeded} · 跳过 {exportProgress.existing} · 失败 {exportProgress.failed}</span></footer>
     </section>
   {:else if sourceRemovalCompletion}
     <section class="source-removal-complete" role="status" aria-live="polite"><Check size={21} /><div><strong>项目来源已移除</strong><span>已移除 {sourceRemovalCompletion.deleted} 个来源和 {sourceRemovalCompletion.candidateDeleted} 个候选；原始文件未删除。</span></div></section>

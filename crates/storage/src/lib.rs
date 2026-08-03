@@ -589,6 +589,31 @@ impl ProjectStore {
             .optional()?)
     }
 
+    pub fn get_candidate_near(
+        &self,
+        source_id: &str,
+        video_offset_ms: u64,
+        tolerance_ms: u64,
+    ) -> Result<Option<StoredCandidateImage>, StorageError> {
+        let start = video_offset_ms.saturating_sub(tolerance_ms);
+        let end = video_offset_ms.saturating_add(tolerance_ms);
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, source_id, video_offset_ms, source_frame_number, selection_method,
+                    parameters_json, image_path, thumbnail_path, width, height, pinned, created_at
+             FROM candidate_images
+             WHERE source_id=?1 AND video_offset_ms BETWEEN ?2 AND ?3
+             ORDER BY ABS(video_offset_ms - ?4), video_offset_ms
+             LIMIT 1",
+        )?;
+        Ok(statement
+            .query_row(
+                params![source_id, start, end, video_offset_ms],
+                row_to_candidate,
+            )
+            .optional()?)
+    }
+
     pub fn get_candidate(&self, id: &str) -> Result<Option<StoredCandidateImage>, StorageError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
