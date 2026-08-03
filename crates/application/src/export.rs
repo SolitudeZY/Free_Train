@@ -176,6 +176,18 @@ pub fn run_export(
 pub fn run_export_with_progress<F>(
     session: &ProjectSession,
     request: &ExportRequest,
+    report_progress: F,
+) -> Result<ExportResult, ApplicationError>
+where
+    F: FnMut(OperationProgress),
+{
+    run_export_with_control(session, request, None, report_progress)
+}
+
+pub fn run_export_with_control<F>(
+    session: &ProjectSession,
+    request: &ExportRequest,
+    control: Option<&OperationControl>,
     mut report_progress: F,
 ) -> Result<ExportResult, ApplicationError>
 where
@@ -215,6 +227,7 @@ where
         skipped: plan.skipped,
         manifest_path: path_text(&manifest_path),
         failures: Vec::new(),
+        cancelled: false,
     };
     let total = plan.items.len() as u64;
     report_progress(OperationProgress {
@@ -226,6 +239,18 @@ where
         failed: 0,
     });
     for (index, item) in plan.items.into_iter().enumerate() {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            result.cancelled = true;
+            report_progress(OperationProgress {
+                phase: "导出已取消".to_owned(),
+                completed: index as u64,
+                total,
+                succeeded: result.written,
+                existing: result.skipped,
+                failed: result.failures.len() as u64,
+            });
+            break;
+        }
         let attempt = (|| -> Result<(), ApplicationError> {
             let source = sources
                 .get(&item.source_id)

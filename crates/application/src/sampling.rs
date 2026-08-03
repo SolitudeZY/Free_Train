@@ -167,6 +167,29 @@ pub fn execute_sampling_with_progress<F>(
     config: &SamplingConfig,
     _ffprobe: &Path,
     ffmpeg: &Path,
+    report_progress: F,
+) -> Result<SamplingExecutionResult, ApplicationError>
+where
+    F: FnMut(OperationProgress),
+{
+    execute_sampling_with_control(
+        session,
+        source_id,
+        config,
+        _ffprobe,
+        ffmpeg,
+        None,
+        report_progress,
+    )
+}
+
+pub fn execute_sampling_with_control<F>(
+    session: &mut ProjectSession,
+    source_id: &str,
+    config: &SamplingConfig,
+    _ffprobe: &Path,
+    ffmpeg: &Path,
+    control: Option<&OperationControl>,
     mut report_progress: F,
 ) -> Result<SamplingExecutionResult, ApplicationError>
 where
@@ -185,6 +208,7 @@ where
         created: 0,
         existing: 0,
         failures: Vec::new(),
+        cancelled: false,
     };
     if let Some(batch_result) = try_execute_sampling_batch(
         session,
@@ -195,12 +219,17 @@ where
         &parameters,
         method,
         ffmpeg,
+        control,
         &mut report_progress,
     )? {
         return Ok(batch_result);
     }
     report_progress(sampling_progress(&result, 0));
     for (planned_index, timestamp_ms) in timestamps.into_iter().enumerate() {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            result.cancelled = true;
+            break;
+        }
         let pinned = config.pin_results
             || ranges.iter().any(|selection| {
                 selection.protected
@@ -243,6 +272,7 @@ fn try_execute_sampling_batch<F>(
     parameters: &str,
     method: &str,
     ffmpeg: &Path,
+    control: Option<&OperationControl>,
     report_progress: &mut F,
 ) -> Result<Option<SamplingExecutionResult>, ApplicationError>
 where
@@ -279,37 +309,59 @@ where
         existing: 0,
         failed: 0,
     });
-    let extracted = match media::extract_video_frames_batch(
-        ffmpeg,
-        &source.absolute_path,
-        &filter,
-        &batch_dir,
-        source
-            .duration_ms
-            .ok_or(ApplicationError::MissingDuration)?,
-        |percent| {
-            report_progress(OperationProgress {
-                phase: "正在顺序解码视频".to_owned(),
-                completed: total.saturating_mul(percent as u64).saturating_mul(80) / 10_000,
-                total,
-                succeeded: 0,
-                existing: 0,
-                failed: 0,
-            });
-        },
-    ) {
-        Ok(paths) if paths.len() == timestamps.len() => paths,
-        Ok(_) | Err(_) => {
-            let _ = fs::remove_dir_all(&batch_dir);
-            report_progress(OperationProgress {
-                phase: "批量解码不可用，正在精确逐帧抽取".to_owned(),
-                completed: 0,
-                total,
-                succeeded: 0,
-                existing: 0,
-                failed: 0,
-            });
-            return Ok(None);
+    let extracted = loop {
+        let attempt = media::extract_video_frames_batch_controlled(
+            ffmpeg,
+            &source.absolute_path,
+            &filter,
+            &batch_dir,
+            source
+                .duration_ms
+                .ok_or(ApplicationError::MissingDuration)?,
+            |percent| {
+                report_progress(OperationProgress {
+                    phase: "正在顺序解码视频".to_owned(),
+                    completed: total.saturating_mul(percent as u64).saturating_mul(80) / 10_000,
+                    total,
+                    succeeded: 0,
+                    existing: 0,
+                    failed: 0,
+                });
+                control.is_none_or(|control| control.state() == OperationState::Running)
+            },
+        );
+        match attempt {
+            Ok(paths) if paths.len() == timestamps.len() => break paths,
+            Err(media::MediaError::Cancelled)
+                if control.is_some_and(|control| control.state() == OperationState::Paused) =>
+            {
+                report_progress(OperationProgress {
+                    phase: "抽帧已暂停；继续后重新开始当前解码批次".to_owned(),
+                    completed: 0,
+                    total,
+                    succeeded: 0,
+                    existing: 0,
+                    failed: 0,
+                });
+                if control.is_some_and(|control| !control.checkpoint()) {
+                    return Ok(Some(cancelled_sampling_result(total, report_progress)));
+                }
+            }
+            Err(media::MediaError::Cancelled) => {
+                return Ok(Some(cancelled_sampling_result(total, report_progress)));
+            }
+            Ok(_) | Err(_) => {
+                let _ = fs::remove_dir_all(&batch_dir);
+                report_progress(OperationProgress {
+                    phase: "批量解码不可用，正在精确逐帧抽取".to_owned(),
+                    completed: 0,
+                    total,
+                    succeeded: 0,
+                    existing: 0,
+                    failed: 0,
+                });
+                return Ok(None);
+            }
         }
     };
 
@@ -336,10 +388,15 @@ where
         created: 0,
         existing: 0,
         failures: Vec::new(),
+        cancelled: false,
     };
     for (index, (timestamp_ms, extracted_path)) in
         timestamps.iter().copied().zip(extracted).enumerate()
     {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            result.cancelled = true;
+            break;
+        }
         let pinned = config.pin_results
             || ranges.iter().any(|selection| {
                 selection.protected
@@ -410,8 +467,41 @@ where
     }
     let _ = fs::remove_dir_all(&batch_dir);
     session.refresh_summary()?;
-    report_progress(sampling_progress(&result, total));
+    if result.cancelled {
+        report_progress(OperationProgress {
+            phase: "抽帧已取消".to_owned(),
+            completed: (result.created + result.existing + result.failures.len() as u64).min(total),
+            total,
+            succeeded: result.created,
+            existing: result.existing,
+            failed: result.failures.len() as u64,
+        });
+    } else {
+        report_progress(sampling_progress(&result, total));
+    }
     Ok(Some(result))
+}
+
+fn cancelled_sampling_result<F>(total: u64, report_progress: &mut F) -> SamplingExecutionResult
+where
+    F: FnMut(OperationProgress),
+{
+    let result = SamplingExecutionResult {
+        planned: total,
+        created: 0,
+        existing: 0,
+        failures: Vec::new(),
+        cancelled: true,
+    };
+    report_progress(OperationProgress {
+        phase: "抽帧已取消".to_owned(),
+        completed: 0,
+        total,
+        succeeded: 0,
+        existing: 0,
+        failed: 0,
+    });
+    result
 }
 
 fn sampling_progress(result: &SamplingExecutionResult, completed: u64) -> OperationProgress {
@@ -469,6 +559,29 @@ pub fn execute_group_sampling_with_progress<F>(
     config: &SamplingConfig,
     ffprobe: &Path,
     ffmpeg: &Path,
+    report_progress: F,
+) -> Result<SamplingExecutionResult, ApplicationError>
+where
+    F: FnMut(OperationProgress),
+{
+    execute_group_sampling_with_control(
+        session,
+        source_group,
+        config,
+        ffprobe,
+        ffmpeg,
+        None,
+        report_progress,
+    )
+}
+
+pub fn execute_group_sampling_with_control<F>(
+    session: &mut ProjectSession,
+    source_group: &str,
+    config: &SamplingConfig,
+    ffprobe: &Path,
+    ffmpeg: &Path,
+    control: Option<&OperationControl>,
     mut report_progress: F,
 ) -> Result<SamplingExecutionResult, ApplicationError>
 where
@@ -495,6 +608,7 @@ where
         created: 0,
         existing: 0,
         failures: Vec::new(),
+        cancelled: false,
     };
     let mut completed = 0_u64;
     report_progress(OperationProgress {
@@ -506,16 +620,21 @@ where
         failed: 0,
     });
     for (source, source_total) in work {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            aggregate.cancelled = true;
+            break;
+        }
         let base_completed = completed;
         let base_created = aggregate.created;
         let base_existing = aggregate.existing;
         let base_failed = aggregate.failures.len() as u64;
-        match execute_sampling_with_progress(
+        match execute_sampling_with_control(
             session,
             &source.id,
             config,
             ffprobe,
             ffmpeg,
+            control,
             |progress| {
                 report_progress(OperationProgress {
                     phase: format!("正在抽帧：{}", source.file_name),
@@ -532,17 +651,30 @@ where
                 aggregate.created += result.created;
                 aggregate.existing += result.existing;
                 aggregate.failures.extend(result.failures);
+                aggregate.cancelled |= result.cancelled;
             }
             Err(error) => aggregate.failures.push(ImportFailure {
                 path: source.absolute_path,
                 error: error.to_string(),
             }),
         }
+        if aggregate.cancelled {
+            break;
+        }
         completed = completed.saturating_add(source_total).min(total);
     }
     report_progress(OperationProgress {
-        phase: "来源组抽帧完成".to_owned(),
-        completed: total,
+        phase: if aggregate.cancelled {
+            "来源组抽帧已取消"
+        } else {
+            "来源组抽帧完成"
+        }
+        .to_owned(),
+        completed: if aggregate.cancelled {
+            completed
+        } else {
+            total
+        },
         total,
         succeeded: aggregate.created,
         existing: aggregate.existing,

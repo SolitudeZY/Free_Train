@@ -109,8 +109,9 @@
     updated: number;
     unsupported: number;
     failures: { path: string; error: string }[];
+    cancelled: boolean;
   };
-  type SourceDeletionResult = { deleted: number; candidateDeleted: number; failures: { path: string; error: string }[] };
+  type SourceDeletionResult = { deleted: number; candidateDeleted: number; failures: { path: string; error: string }[]; cancelled: boolean };
   type SourceDeletionProgress = { completed: number; total: number; deleted: number; candidateDeleted: number };
   type ImportProgress = { phase: string; completed: number; total: number; imported: number; updated: number; unsupported: number; failed: number };
   type OperationProgress = { phase: string; completed: number; total: number; succeeded: number; existing: number; failed: number };
@@ -127,7 +128,7 @@
   };
   type SamplingEstimate = { timestampsMs: number[]; estimatedCount: number; existingCount: number; estimatedNewCount: number };
   type GroupSamplingEstimate = { sourceCount: number; estimatedCount: number; existingCount: number; estimatedNewCount: number };
-  type SamplingExecutionResult = { planned: number; created: number; existing: number; failures: { path: string; error: string }[] };
+  type SamplingExecutionResult = { planned: number; created: number; existing: number; failures: { path: string; error: string }[]; cancelled: boolean };
   type CandidateDeletionResult = { deleted: number; failures: { path: string; error: string }[] };
   type ChangePoint = { timestampMs: number; score: number };
   type ChangeAnalysis = { points: ChangePoint[]; suggestedTimestampsMs: number[] };
@@ -162,7 +163,9 @@
     outputDir: string; items: { fileName: string; placement: TilePlacement }[];
     skipped: number; estimatedBytes: number;
   };
-  type ExportResult = { exportId: string; written: number; skipped: number; manifestPath: string; failures: { path: string; error: string }[] };
+  type ExportResult = { exportId: string; written: number; skipped: number; manifestPath: string; failures: { path: string; error: string }[]; cancelled: boolean };
+  type ControllableOperation = "import" | "source_removal" | "sampling" | "export";
+  type OperationControlState = "running" | "paused" | "cancelling";
   type SimilarityScope = "source" | "source_group" | "project";
   type QualityMetricKey = "sharpness" | "low_information" | "underexposed" | "overexposed" | "resolution";
   type ReviewAction = "keep" | "exclude" | "restore" | "lock" | "unlock" | "make_representative";
@@ -221,6 +224,7 @@
   let importProgress = $state<ImportProgress | null>(null);
   let samplingProgress = $state<OperationProgress | null>(null);
   let exportProgress = $state<OperationProgress | null>(null);
+  let operationControlState = $state<OperationControlState>("running");
   let sourceRemovalCompletion = $state<{ deleted: number; candidateDeleted: number } | null>(null);
   let sourceRemovalCompletionTimer: number | undefined;
   let dragActive = $state(false);
@@ -799,6 +803,7 @@
     pendingSourceRemovalIds = [];
     sourceRemovalCompletion = null;
     sourceRemovalProgress = { completed: 0, total: sourceIds.length, deleted: 0, candidateDeleted: 0 };
+    operationControlState = "running";
     busyMessage = `正在移除项目来源 0 / ${sourceIds.length}`;
     try {
       const result = await invoke<SourceDeletionResult>("remove_sources", { sourceIds });
@@ -808,7 +813,7 @@
       if (sourceRemovalCompletionTimer !== undefined) window.clearTimeout(sourceRemovalCompletionTimer);
       sourceRemovalCompletionTimer = window.setTimeout(() => (sourceRemovalCompletion = null), 4_500);
       setMessage(
-        `已移除 ${result.deleted} 个来源和 ${result.candidateDeleted} 个候选${result.failures.length ? `，${result.failures.length} 个缓存文件未能清理` : ""}`,
+        `${result.cancelled ? "已取消；此前" : "已"}移除 ${result.deleted} 个来源和 ${result.candidateDeleted} 个候选${result.failures.length ? `，${result.failures.length} 个缓存文件未能清理` : ""}`,
         result.failures.length ? "error" : "info",
       );
     } catch (error) {
@@ -1308,9 +1313,10 @@
     if (!selectedSource || !exportDirectory || !exportPlan) return;
     exportBusy = exportContent === "frames" ? "正在导出候选帧与来源清单" : "正在导出切片与来源清单";
     exportProgress = null;
+    operationControlState = "running";
     try {
       const result = await invoke<ExportResult>("run_export", { request: currentExportRequest() });
-      setMessage("已导出 " + result.written + " 张，清单：" + result.manifestPath, result.failures.length ? "error" : "info");
+      setMessage(`${result.cancelled ? "导出已取消；已完成" : "已导出"} ${result.written} 张，清单：${result.manifestPath}`, result.failures.length ? "error" : "info");
       exportPlan = null;
     } catch (error) {
       setMessage(errorText(error), "error");
@@ -1567,6 +1573,7 @@
     videoBusy = "正在执行视频抽帧";
     samplingProgress = null;
     samplingCompletion = null;
+    operationControlState = "running";
     try {
       const groupRun = applySourceGroup && !["valid_ranges", "change_triggered"].includes(samplingMode);
       const result = groupRun
@@ -1575,8 +1582,8 @@
       candidates = await invoke<CandidateImage[]>("get_candidates", { sourceId: selectedSource.id, offset: 0, limit: 10_000 });
       checkedCandidateIds = new Set();
       project = await invoke<ProjectSummary | null>("get_current_project");
-      samplingCompletion = { result, sourceScope: groupRun ? "source_group" : "current" };
-      setMessage(`新增 ${result.created} 个，已有 ${result.existing} 个${result.failures.length ? `，失败 ${result.failures.length} 个` : ""}`, result.failures.length ? "error" : "info");
+      if (!result.cancelled) samplingCompletion = { result, sourceScope: groupRun ? "source_group" : "current" };
+      setMessage(`${result.cancelled ? "抽帧已取消；此前" : ""}新增 ${result.created} 个，已有 ${result.existing} 个${result.failures.length ? `，失败 ${result.failures.length} 个` : ""}`, result.failures.length ? "error" : "info");
     } catch (error) {
       setMessage(errorText(error), "error");
     } finally {
@@ -1663,7 +1670,7 @@
 
   async function loadSources(selectFirst = false) {
     if (!project) return;
-    sources = await invoke<SourceAsset[]>("list_sources", { offset: 0, limit: 10_000 });
+    sources = await invoke<SourceAsset[]>("list_sources", { offset: 0, limit: 100_000 });
     visibleLimit = pageSize;
     let nextSourceId = selectedSourceId;
     if (selectFirst || !sources.some((source) => source.id === selectedSourceId)) {
@@ -1783,17 +1790,30 @@
     if (!project || paths.length === 0) return;
     busyMessage = `正在检查 ${paths.length} 个导入入口`;
     importProgress = null;
+    operationControlState = "running";
     importMenuOpen = false;
     try {
       const result = await invoke<ImportResult>("import_sources", { paths });
       await loadSources(true);
       const failureText = result.failures.length ? `，${result.failures.length} 个失败` : "";
-      setMessage(`导入 ${result.imported} 个，更新 ${result.updated} 个，忽略 ${result.unsupported} 个不支持文件${failureText}`, result.failures.length ? "error" : "info");
+      setMessage(`${result.cancelled ? "导入已取消；此前" : ""}导入 ${result.imported} 个，更新 ${result.updated} 个，忽略 ${result.unsupported} 个不支持文件${failureText}`, result.failures.length ? "error" : "info");
     } catch (error) {
       setMessage(errorText(error), "error");
     } finally {
       busyMessage = "";
       importProgress = null;
+    }
+  }
+
+  async function controlLongOperation(kind: ControllableOperation, action: "pause" | "resume" | "cancel") {
+    if (operationControlState === "cancelling") return;
+    if (action === "cancel") operationControlState = "cancelling";
+    try {
+      operationControlState = await invoke<OperationControlState>("control_operation", { kind, action });
+      if (operationControlState === "paused") setMessage("任务已暂停，点击继续恢复处理");
+      else if (operationControlState === "cancelling") setMessage("正在取消任务，等待当前文件安全结束");
+    } catch (error) {
+      setMessage(errorText(error), "error");
     }
   }
 
@@ -2763,29 +2783,29 @@
   {#if dragActive}<div class="drop-overlay"><FolderInput size={38} /><strong>{project ? "松开以导入源素材" : "请先创建或打开项目"}</strong><span>支持文件和递归目录</span></div>{/if}
 
   {#if sourceRemovalProgress}
-    <section class="source-removal-progress" role="status" aria-live="polite">
-      <header><LoaderCircle size={17} class="spinning" /><strong>正在移除项目来源</strong></header>
+    <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class={operationControlState === "running" ? "spinning" : ""} /><strong>{operationControlState === "paused" ? "来源移除已暂停" : operationControlState === "cancelling" ? "正在取消来源移除" : "正在移除项目来源"}</strong><div class="progress-actions"><button disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("source_removal", operationControlState === "paused" ? "resume" : "pause")} title={operationControlState === "paused" ? "继续移除" : "暂停移除"} aria-label={operationControlState === "paused" ? "继续移除" : "暂停移除"}>{#if operationControlState === "paused"}<Play size={14} />{:else}<Pause size={14} />{/if}</button><button class="cancel" disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("source_removal", "cancel")} title="取消来源移除" aria-label="取消来源移除"><X size={15} /></button></div></header>
       <p>仅清理项目引用与缓存，原始图片和视频保持不变。</p>
       <div class="source-progress-track"><span style:width={`${sourceRemovalProgress.total ? sourceRemovalProgress.completed / sourceRemovalProgress.total * 100 : 0}%`}></span></div>
       <footer><span>{sourceRemovalProgress.completed} / {sourceRemovalProgress.total}</span><span>来源 {sourceRemovalProgress.deleted} · 候选 {sourceRemovalProgress.candidateDeleted}</span></footer>
     </section>
   {:else if importProgress}
-    <section class="source-removal-progress" role="status" aria-live="polite">
-      <header><LoaderCircle size={17} class="spinning" /><strong>{importProgress.phase}</strong></header>
+    <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class={operationControlState === "running" ? "spinning" : ""} /><strong>{operationControlState === "paused" ? "图片导入已暂停" : operationControlState === "cancelling" ? "正在取消图片导入" : importProgress.phase}</strong><div class="progress-actions"><button disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("import", operationControlState === "paused" ? "resume" : "pause")} title={operationControlState === "paused" ? "继续导入" : "暂停导入"} aria-label={operationControlState === "paused" ? "继续导入" : "暂停导入"}>{#if operationControlState === "paused"}<Play size={14} />{:else}<Pause size={14} />{/if}</button><button class="cancel" disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("import", "cancel")} title="取消导入" aria-label="取消导入"><X size={15} /></button></div></header>
       <p>正在建立项目引用和预览缩略图；原始文件保持不变。</p>
-      <div class="source-progress-track"><span style:width={`${importProgress.total ? importProgress.completed / importProgress.total * 100 : 0}%`}></span></div>
-      <footer><span>{importProgress.completed} / {importProgress.total}</span><span>新增 {importProgress.imported} · 更新 {importProgress.updated} · 忽略 {importProgress.unsupported} · 失败 {importProgress.failed}</span></footer>
+      <div class="source-progress-track" class:indeterminate={!importProgress.total}><span style:width={`${importProgress.total ? importProgress.completed / importProgress.total * 100 : 28}%`}></span></div>
+      <footer><span>{importProgress.total ? `${importProgress.completed} / ${importProgress.total}` : `已发现 ${importProgress.completed}`}</span><span>新增 {importProgress.imported} · 更新 {importProgress.updated} · 忽略 {importProgress.unsupported} · 失败 {importProgress.failed}</span></footer>
     </section>
   {:else if samplingProgress}
-    <section class="source-removal-progress" role="status" aria-live="polite">
-      <header><LoaderCircle size={17} class="spinning" /><strong>{samplingProgress.phase}</strong></header>
+    <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class={operationControlState === "running" ? "spinning" : ""} /><strong>{operationControlState === "paused" ? "视频抽帧已暂停" : operationControlState === "cancelling" ? "正在取消视频抽帧" : samplingProgress.phase}</strong><div class="progress-actions"><button disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("sampling", operationControlState === "paused" ? "resume" : "pause")} title={operationControlState === "paused" ? "继续抽帧" : "暂停抽帧"} aria-label={operationControlState === "paused" ? "继续抽帧" : "暂停抽帧"}>{#if operationControlState === "paused"}<Play size={14} />{:else}<Pause size={14} />{/if}</button><button class="cancel" disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("sampling", "cancel")} title="取消抽帧" aria-label="取消抽帧"><X size={15} /></button></div></header>
       <p>候选图片写入项目缓存；原视频保持不变。</p>
       <div class="source-progress-track"><span style:width={`${samplingProgress.total ? samplingProgress.completed / samplingProgress.total * 100 : 0}%`}></span></div>
       <footer><span>{samplingProgress.completed} / {samplingProgress.total}</span><span>新增 {samplingProgress.succeeded} · 已有 {samplingProgress.existing} · 失败 {samplingProgress.failed}</span></footer>
     </section>
   {:else if exportProgress}
-    <section class="source-removal-progress" role="status" aria-live="polite">
-      <header><LoaderCircle size={17} class="spinning" /><strong>{exportProgress.phase}</strong></header>
+    <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class={operationControlState === "running" ? "spinning" : ""} /><strong>{operationControlState === "paused" ? "图片导出已暂停" : operationControlState === "cancelling" ? "正在取消图片导出" : exportProgress.phase}</strong><div class="progress-actions"><button disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("export", operationControlState === "paused" ? "resume" : "pause")} title={operationControlState === "paused" ? "继续导出" : "暂停导出"} aria-label={operationControlState === "paused" ? "继续导出" : "暂停导出"}>{#if operationControlState === "paused"}<Play size={14} />{:else}<Pause size={14} />{/if}</button><button class="cancel" disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("export", "cancel")} title="取消导出" aria-label="取消导出"><X size={15} /></button></div></header>
       <p>正在写入图片与来源追溯清单。</p>
       <div class="source-progress-track"><span style:width={`${exportProgress.total ? exportProgress.completed / exportProgress.total * 100 : 0}%`}></span></div>
       <footer><span>{exportProgress.completed} / {exportProgress.total}</span><span>写入 {exportProgress.succeeded} · 跳过 {exportProgress.existing} · 失败 {exportProgress.failed}</span></footer>

@@ -264,6 +264,30 @@ pub fn extract_video_frames_batch<F>(
 where
     F: FnMut(u8),
 {
+    extract_video_frames_batch_controlled(
+        executable,
+        source,
+        filter,
+        destination_dir,
+        duration_ms,
+        |percent| {
+            report_progress(percent);
+            true
+        },
+    )
+}
+
+pub fn extract_video_frames_batch_controlled<F>(
+    executable: impl AsRef<Path>,
+    source: impl AsRef<Path>,
+    filter: &str,
+    destination_dir: impl AsRef<Path>,
+    duration_ms: u64,
+    mut report_progress: F,
+) -> Result<Vec<std::path::PathBuf>, MediaError>
+where
+    F: FnMut(u8) -> bool,
+{
     let executable = executable.as_ref();
     let source = source.as_ref();
     let destination_dir = destination_dir.as_ref();
@@ -279,6 +303,7 @@ where
         &mut report_progress,
     ) {
         Ok(paths) => return Ok(paths),
+        Err(MediaError::Cancelled) => return Err(MediaError::Cancelled),
         Err(_) => reset_batch_directory(destination_dir)?,
     }
 
@@ -303,7 +328,7 @@ fn run_video_frame_batch<F>(
     report_progress: &mut F,
 ) -> Result<Vec<std::path::PathBuf>, MediaError>
 where
-    F: FnMut(u8),
+    F: FnMut(u8) -> bool,
 {
     reset_batch_directory(destination_dir)?;
     let output_pattern = destination_dir.join("frame-%08d.jpg");
@@ -326,7 +351,12 @@ where
             && duration_ms > 0
         {
             let percent = ((elapsed_us / 1_000).saturating_mul(100) / duration_ms).min(99) as u8;
-            report_progress(percent);
+            if !report_progress(percent) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reset_batch_directory(destination_dir);
+                return Err(MediaError::Cancelled);
+            }
         }
     }
     let output = child.wait_with_output()?;
@@ -342,7 +372,10 @@ where
         .filter(|path| path.extension().is_some_and(|extension| extension == "jpg"))
         .collect::<Vec<_>>();
     paths.sort();
-    report_progress(100);
+    if !report_progress(100) {
+        let _ = reset_batch_directory(destination_dir);
+        return Err(MediaError::Cancelled);
+    }
     Ok(paths)
 }
 
@@ -672,6 +705,8 @@ pub enum MediaError {
     MissingProcessPipe,
     #[error("无法生成浏览器兼容预览：{0}")]
     VideoPreviewFailed(String),
+    #[error("操作已取消")]
+    Cancelled,
 }
 
 #[cfg(test)]

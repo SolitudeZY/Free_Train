@@ -31,6 +31,7 @@ fs2 = "0.4"
 hex = "0.4"
 rand = "0.9"
 rand_chacha = "0.9"
+rayon = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustdct = "0.7"
 serde = { version = "1", features = ["derive"] }

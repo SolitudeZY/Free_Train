@@ -15,6 +15,7 @@ use image_pipeline::{
     resolve_file_name,
 };
 use media::ChangePoint;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{
@@ -26,12 +27,14 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod export;
+mod operation_control;
 mod review;
 mod roi;
 mod sampling;
 mod video_preview;
 
-pub use export::{plan_export, run_export, run_export_with_progress};
+pub use export::{plan_export, run_export, run_export_with_control, run_export_with_progress};
+pub use operation_control::{OperationControl, OperationState};
 pub use review::{
     list_review_workspace, list_review_workspace_at, redo_review_action, run_review_analysis,
     run_review_analysis_at, undo_review_action, update_review_items,
@@ -42,8 +45,9 @@ pub use roi::{
 pub use sampling::{
     analyze_changes, capture_manual_frame, create_video_selection, delete_candidates,
     delete_video_selection, estimate_group_sampling, estimate_sampling, execute_group_sampling,
-    execute_group_sampling_with_progress, execute_sampling, execute_sampling_with_progress,
-    list_candidates, list_video_selections, plan_sampling_times, video_frame_timestamps,
+    execute_group_sampling_with_control, execute_group_sampling_with_progress, execute_sampling,
+    execute_sampling_with_control, execute_sampling_with_progress, list_candidates,
+    list_video_selections, plan_sampling_times, video_frame_timestamps,
 };
 pub use video_preview::{
     VideoPreview, VideoPreviewPlan, execute_video_preview, plan_video_preview,
@@ -162,6 +166,8 @@ pub struct ImportResult {
     pub updated: u64,
     pub unsupported: u64,
     pub failures: Vec<ImportFailure>,
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +216,8 @@ pub struct SamplingExecutionResult {
     pub created: u64,
     pub existing: u64,
     pub failures: Vec<ImportFailure>,
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +256,8 @@ pub struct SourceDeletionResult {
     pub deleted: u64,
     pub candidate_deleted: u64,
     pub failures: Vec<ImportFailure>,
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,6 +511,8 @@ pub struct ExportResult {
     pub skipped: u64,
     pub manifest_path: String,
     pub failures: Vec<ImportFailure>,
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug)]
@@ -615,6 +627,20 @@ pub fn import_sources_with_progress<F>(
     inputs: &[String],
     ffprobe: &Path,
     ffmpeg: &Path,
+    report_progress: F,
+) -> Result<ImportResult, ApplicationError>
+where
+    F: FnMut(ImportProgress),
+{
+    import_sources_with_control(session, inputs, ffprobe, ffmpeg, None, report_progress)
+}
+
+pub fn import_sources_with_control<F>(
+    session: &mut ProjectSession,
+    inputs: &[String],
+    ffprobe: &Path,
+    ffmpeg: &Path,
+    control: Option<&OperationControl>,
     mut report_progress: F,
 ) -> Result<ImportResult, ApplicationError>
 where
@@ -628,10 +654,15 @@ where
         updated: 0,
         unsupported: 0,
         failures: Vec::new(),
+        cancelled: false,
     };
     let mut work = Vec::<(PathBuf, PathBuf)>::new();
 
     for (input_index, input) in inputs.iter().enumerate() {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            result.cancelled = true;
+            break;
+        }
         report_progress(ImportProgress {
             phase: "正在扫描导入路径".to_owned(),
             completed: input_index as u64,
@@ -660,18 +691,43 @@ where
         .canonicalize()
         .unwrap_or_else(|_| input_path.clone());
         let candidates: Vec<PathBuf> = if input_path.is_dir() {
-            WalkDir::new(&input_path)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_file())
-                .map(|entry| entry.into_path())
-                .collect()
+            let mut candidates = Vec::new();
+            for entry in WalkDir::new(&input_path).follow_links(false) {
+                if control.is_some_and(|control| !control.checkpoint()) {
+                    result.cancelled = true;
+                    break;
+                }
+                if let Ok(entry) = entry
+                    && entry.file_type().is_file()
+                {
+                    candidates.push(entry.into_path());
+                    if candidates.len().is_multiple_of(256) {
+                        report_progress(ImportProgress {
+                            phase: format!("正在扫描导入路径：已发现 {} 个文件", candidates.len()),
+                            completed: candidates.len() as u64,
+                            total: 0,
+                            imported: 0,
+                            updated: 0,
+                            unsupported: 0,
+                            failed: result.failures.len() as u64,
+                        });
+                    }
+                }
+            }
+            candidates
         } else {
             vec![input_path]
         };
         work.extend(candidates.into_iter().map(|path| (root.clone(), path)));
+        if result.cancelled {
+            break;
+        }
     }
+    let mut unique_paths = HashSet::new();
+    work.retain(|(_, path)| {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        unique_paths.insert(path_text(&canonical).to_ascii_lowercase())
+    });
     let total = work.len() as u64;
     report_progress(ImportProgress {
         phase: "正在读取素材并生成缩略图".to_owned(),
@@ -682,32 +738,146 @@ where
         unsupported: 0,
         failed: result.failures.len() as u64,
     });
-    for (index, (root, path)) in work.into_iter().enumerate() {
-        result.discovered += 1;
-        if let Some(kind) = SourceKind::from_path(&path) {
-            match inspect_and_store(&store, &thumbnail_dir, &root, &path, kind, ffprobe, ffmpeg) {
-                Ok(true) => result.updated += 1,
-                Ok(false) => result.imported += 1,
-                Err(error) => result.failures.push(ImportFailure {
-                    path: path_text(&path),
-                    error: error.to_string(),
-                }),
-            }
-        } else {
-            result.unsupported += 1;
+    let existing_sources = store.list_sources(0, 1_000_000)?;
+    let by_path = existing_sources
+        .iter()
+        .map(|asset| (asset.absolute_path.to_ascii_lowercase(), asset.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut by_fingerprint = HashMap::<(&'static str, u64, String), Vec<StoredSourceAsset>>::new();
+    for asset in existing_sources {
+        by_fingerprint
+            .entry((
+                source_kind_key(asset.kind),
+                asset.size_bytes,
+                asset.quick_fingerprint.clone(),
+            ))
+            .or_default()
+            .push(asset);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 4)),
+        )
+        .build()
+        .map_err(|error| ApplicationError::InvalidMedia(error.to_string()))?;
+    let mut completed = 0_u64;
+    let mut claimed_existing_ids = HashSet::new();
+    for chunk in work.chunks(64) {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            result.cancelled = true;
+            break;
         }
+        let assignments = chunk
+            .iter()
+            .map(|(_, path)| {
+                let kind = SourceKind::from_path(path)?;
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if let Some(existing) = by_path
+                    .get(&path_text(&canonical).to_ascii_lowercase())
+                    .cloned()
+                {
+                    claimed_existing_ids.insert(existing.id.clone());
+                    return Some((Some(existing), None));
+                }
+                let metadata = fs::metadata(&canonical).ok()?;
+                let fingerprint = quick_fingerprint(&canonical).ok()?;
+                let matches = by_fingerprint.get(&(
+                    source_kind_key(kind),
+                    metadata.len(),
+                    fingerprint.clone(),
+                ))?;
+                let available = matches
+                    .iter()
+                    .filter(|asset| {
+                        current_source_status(asset).0 != SourceStatus::Online
+                            && !claimed_existing_ids.contains(&asset.id)
+                    })
+                    .collect::<Vec<_>>();
+                let existing = (available.len() == 1).then(|| (*available[0]).clone());
+                if let Some(existing) = &existing {
+                    claimed_existing_ids.insert(existing.id.clone());
+                }
+                Some((existing, Some(fingerprint)))
+            })
+            .collect::<Vec<_>>();
+        let prepared = pool.install(|| {
+            chunk
+                .par_iter()
+                .zip(assignments.par_iter())
+                .map(|((root, path), assignment)| {
+                    let Some(kind) = SourceKind::from_path(path) else {
+                        return PreparedImport::Unsupported;
+                    };
+                    let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                    let (existing, fingerprint) = assignment
+                        .as_ref()
+                        .map(|(existing, fingerprint)| (existing.as_ref(), fingerprint.clone()))
+                        .unwrap_or((None, None));
+                    match inspect_source(
+                        &thumbnail_dir,
+                        root,
+                        &canonical,
+                        kind,
+                        existing,
+                        fingerprint,
+                        ffprobe,
+                        ffmpeg,
+                    ) {
+                        Ok(asset) => PreparedImport::Ready(Box::new(asset)),
+                        Err(error) => PreparedImport::Failed(ImportFailure {
+                            path: path_text(path),
+                            error: error.to_string(),
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut ready = Vec::new();
+        for item in prepared {
+            result.discovered += 1;
+            match item {
+                PreparedImport::Ready(asset) => ready.push(*asset),
+                PreparedImport::Unsupported => result.unsupported += 1,
+                PreparedImport::Failed(failure) => result.failures.push(failure),
+            }
+        }
+        for existed in store.upsert_sources(&ready)? {
+            if existed {
+                result.updated += 1;
+            } else {
+                result.imported += 1;
+            }
+        }
+        completed += chunk.len() as u64;
         report_progress(ImportProgress {
-            phase: "正在读取素材并生成缩略图".to_owned(),
-            completed: index as u64 + 1,
+            phase: "正在批量读取素材并生成缩略图".to_owned(),
+            completed,
             total,
             imported: result.imported,
             updated: result.updated,
             unsupported: result.unsupported,
             failed: result.failures.len() as u64,
         });
+        if control.is_some_and(|control| control.state() == OperationState::Cancelled) {
+            result.cancelled = true;
+            break;
+        }
     }
     session.refresh_summary()?;
     Ok(result)
+}
+
+enum PreparedImport {
+    Ready(Box<StoredSourceAsset>),
+    Unsupported,
+    Failed(ImportFailure),
+}
+
+fn source_kind_key(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Image => "image",
+        SourceKind::Video => "video",
+    }
 }
 
 pub fn list_sources(
@@ -715,7 +885,7 @@ pub fn list_sources(
     offset: u32,
     limit: u32,
 ) -> Result<Vec<StoredSourceAsset>, ApplicationError> {
-    Ok(ProjectStore::open(session.database_path())?.list_sources(offset, limit.min(10_000))?)
+    Ok(ProjectStore::open(session.database_path())?.list_sources(offset, limit.min(100_000))?)
 }
 
 pub fn list_all_source_ids(session: &ProjectSession) -> Result<Vec<String>, ApplicationError> {
@@ -732,6 +902,18 @@ pub fn delete_sources(
 pub fn delete_sources_with_progress<F>(
     session: &mut ProjectSession,
     source_ids: &[String],
+    report_progress: F,
+) -> Result<SourceDeletionResult, ApplicationError>
+where
+    F: FnMut(SourceDeletionProgress),
+{
+    delete_sources_with_control(session, source_ids, None, report_progress)
+}
+
+pub fn delete_sources_with_control<F>(
+    session: &mut ProjectSession,
+    source_ids: &[String],
+    control: Option<&OperationControl>,
     mut report_progress: F,
 ) -> Result<SourceDeletionResult, ApplicationError>
 where
@@ -748,6 +930,7 @@ where
         deleted: 0,
         candidate_deleted: 0,
         failures: Vec::new(),
+        cancelled: false,
     };
     let total = targets.len() as u64;
     report_progress(SourceDeletionProgress {
@@ -757,6 +940,10 @@ where
         candidate_deleted: 0,
     });
     for (position, source_id) in targets.into_iter().enumerate() {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            result.cancelled = true;
+            break;
+        }
         let Some(source) = store.get_source(source_id)? else {
             report_progress(SourceDeletionProgress {
                 completed: position as u64 + 1,
@@ -842,14 +1029,25 @@ fn remove_cache_file(cache_root: &Path, path: &Path, failures: &mut Vec<ImportFa
 }
 
 pub fn complete_pending_hashes(database_path: &Path) -> Result<u64, ApplicationError> {
+    complete_pending_hashes_limited(database_path, usize::MAX)
+}
+
+pub fn complete_pending_hashes_limited(
+    database_path: &Path,
+    limit: usize,
+) -> Result<u64, ApplicationError> {
     let store = ProjectStore::open(database_path)?;
     let assets = store.list_sources(0, 1_000_000)?;
     let mut completed = 0;
-    for asset in assets.into_iter().filter(|asset| {
-        asset.kind == SourceKind::Image
-            && asset.sha256.is_none()
-            && asset.status == SourceStatus::Online
-    }) {
+    for asset in assets
+        .into_iter()
+        .filter(|asset| {
+            asset.kind == SourceKind::Image
+                && asset.sha256.is_none()
+                && asset.status == SourceStatus::Online
+        })
+        .take(limit)
+    {
         let path = PathBuf::from(&asset.absolute_path);
         if path.is_file() {
             store.update_source_sha256(&asset.id, &full_hash(&path)?)?;
@@ -956,15 +1154,16 @@ pub fn read_recent_project(config_file: &Path) -> Result<Option<String>, Applica
         .map(str::to_owned))
 }
 
-fn inspect_and_store(
-    store: &ProjectStore,
+fn inspect_source(
     thumbnail_dir: &Path,
     root: &Path,
     path: &Path,
     kind: SourceKind,
+    existing: Option<&StoredSourceAsset>,
+    known_fingerprint: Option<String>,
     ffprobe: &Path,
     ffmpeg: &Path,
-) -> Result<bool, ApplicationError> {
+) -> Result<StoredSourceAsset, ApplicationError> {
     let path = path.canonicalize()?;
     let metadata = fs::metadata(&path)?;
     if metadata.len() == 0 {
@@ -972,28 +1171,27 @@ fn inspect_and_store(
     }
     let now = Utc::now().to_rfc3339();
     let absolute_path = path_text(&path);
-    let fingerprint = quick_fingerprint(&path)?;
-    let existing = match store.get_source_by_path(&absolute_path)? {
-        Some(asset) => Some(asset),
-        None => {
-            let mut displaced = store
-                .find_sources_by_fingerprint(kind, metadata.len(), &fingerprint)?
-                .into_iter()
-                .filter(|asset| current_source_status(asset).0 != SourceStatus::Online)
-                .collect::<Vec<_>>();
-            if displaced.len() == 1 {
-                displaced.pop()
-            } else {
-                None
-            }
-        }
-    };
+    let modified_unix_ms = modified_ms(&metadata)?;
+    if let Some(existing) = existing
+        && existing.absolute_path.eq_ignore_ascii_case(&absolute_path)
+        && existing.size_bytes == metadata.len()
+        && existing.modified_unix_ms == modified_unix_ms
+        && existing
+            .thumbnail_path
+            .as_ref()
+            .is_some_and(|thumbnail| Path::new(thumbnail).is_file())
+    {
+        let mut unchanged = existing.clone();
+        unchanged.status = SourceStatus::Online;
+        unchanged.error = None;
+        unchanged.last_checked_at = now;
+        return Ok(unchanged);
+    }
+    let fingerprint = known_fingerprint.map_or_else(|| quick_fingerprint(&path), Ok)?;
     let id = existing
-        .as_ref()
         .map(|asset| asset.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let thumbnail_path = existing
-        .as_ref()
         .and_then(|asset| asset.thumbnail_path.as_ref())
         .map(PathBuf::from)
         .unwrap_or_else(|| thumbnail_dir.join(format!("{id}.jpg")));
@@ -1028,9 +1226,9 @@ fn inspect_and_store(
         kind,
         status: SourceStatus::Online,
         size_bytes: metadata.len(),
-        modified_unix_ms: modified_ms(&metadata)?,
+        modified_unix_ms,
         quick_fingerprint: fingerprint,
-        sha256: existing.as_ref().and_then(|asset| asset.sha256.clone()),
+        sha256: existing.and_then(|asset| asset.sha256.clone()),
         width: None,
         height: None,
         duration_ms: None,
@@ -1042,7 +1240,6 @@ fn inspect_and_store(
         thumbnail_path: None,
         error: None,
         imported_at: existing
-            .as_ref()
             .map(|asset| asset.imported_at.clone())
             .unwrap_or_else(|| now.clone()),
         last_checked_at: now,
@@ -1071,7 +1268,7 @@ fn inspect_and_store(
         }
     }
     asset.thumbnail_path = Some(path_text(&thumbnail_path));
-    Ok(store.upsert_source(&asset)?)
+    Ok(asset)
 }
 
 fn validate_project_name(name: &str) -> Result<(), ApplicationError> {
@@ -2001,6 +2198,43 @@ mod project_tests {
         assert_eq!(relinked.status, SourceStatus::Online);
         assert_eq!(relinked.file_name, "已移动.png");
         drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_large_import_stops_after_the_current_safe_batch() {
+        let root = test_root("import-cancel");
+        let source_dir = root.join("bulk-images");
+        fs::create_dir_all(&source_dir).unwrap();
+        let image =
+            ImageBuffer::from_fn(32, 24, |x, y| Rgb([(x * 5) as u8, (y * 7) as u8, 110_u8]));
+        for index in 0..65 {
+            image
+                .save(source_dir.join(format!("image-{index:03}.png")))
+                .unwrap();
+        }
+        let mut session = ProjectSession::create(&root, "cancel-project").unwrap();
+        let control = OperationControl::new();
+        let progress_control = control.clone();
+
+        let result = import_sources_with_control(
+            &mut session,
+            &[path_text(&source_dir)],
+            Path::new("ffprobe"),
+            Path::new("ffmpeg"),
+            Some(&control),
+            move |progress| {
+                if progress.completed == 64 {
+                    progress_control.cancel();
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(result.cancelled);
+        assert_eq!(result.imported, 64);
+        assert_eq!(list_sources(&session, 0, 100).unwrap().len(), 64);
+        drop(session);
         fs::remove_dir_all(root).unwrap();
     }
 

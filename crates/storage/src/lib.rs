@@ -339,63 +339,17 @@ impl ProjectStore {
 
     pub fn upsert_source(&self, asset: &StoredSourceAsset) -> Result<bool, StorageError> {
         let connection = self.connection()?;
-        let existed = connection
-            .query_row(
-                "SELECT 1 FROM source_assets WHERE id = ?1",
-                params![asset.id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        connection.execute(
-            r#"INSERT INTO source_assets (
-                id, absolute_path, file_name, relative_folder, source_group, source_identifier,
-                kind, status, size_bytes, modified_unix_ms, quick_fingerprint, sha256, width,
-                height, duration_ms, codec, frame_rate, capture_time, capture_time_source,
-                orientation, thumbnail_path, error, imported_at, last_checked_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
-            ) ON CONFLICT(id) DO UPDATE SET
-                absolute_path=excluded.absolute_path, file_name=excluded.file_name,
-                relative_folder=excluded.relative_folder,
-                source_group=excluded.source_group, source_identifier=excluded.source_identifier,
-                kind=excluded.kind, status=excluded.status, size_bytes=excluded.size_bytes,
-                modified_unix_ms=excluded.modified_unix_ms,
-                quick_fingerprint=excluded.quick_fingerprint,
-                sha256=COALESCE(excluded.sha256, source_assets.sha256), width=excluded.width,
-                height=excluded.height, duration_ms=excluded.duration_ms, codec=excluded.codec,
-                frame_rate=excluded.frame_rate, capture_time=excluded.capture_time,
-                capture_time_source=excluded.capture_time_source, orientation=excluded.orientation,
-                thumbnail_path=excluded.thumbnail_path, error=excluded.error,
-                last_checked_at=excluded.last_checked_at"#,
-            params![
-                asset.id,
-                asset.absolute_path,
-                asset.file_name,
-                asset.relative_folder,
-                asset.source_group,
-                asset.source_identifier,
-                kind_text(asset.kind),
-                status_text(asset.status),
-                asset.size_bytes,
-                asset.modified_unix_ms,
-                asset.quick_fingerprint,
-                asset.sha256,
-                asset.width,
-                asset.height,
-                asset.duration_ms,
-                asset.codec,
-                asset.frame_rate,
-                asset.capture_time,
-                asset.capture_time_source,
-                asset.orientation,
-                asset.thumbnail_path,
-                asset.error,
-                asset.imported_at,
-                asset.last_checked_at,
-            ],
-        )?;
+        upsert_source_on(&connection, asset)
+    }
+
+    pub fn upsert_sources(&self, assets: &[StoredSourceAsset]) -> Result<Vec<bool>, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut existed = Vec::with_capacity(assets.len());
+        for asset in assets {
+            existed.push(upsert_source_on(&transaction, asset)?);
+        }
+        transaction.commit()?;
         Ok(existed)
     }
 
@@ -1065,6 +1019,70 @@ fn status_text(status: SourceStatus) -> &'static str {
         SourceStatus::Offline => "offline",
         SourceStatus::Error => "error",
     }
+}
+
+fn upsert_source_on(
+    connection: &Connection,
+    asset: &StoredSourceAsset,
+) -> Result<bool, StorageError> {
+    let existed = connection
+        .query_row(
+            "SELECT 1 FROM source_assets WHERE id = ?1",
+            params![asset.id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    connection.execute(
+        r#"INSERT INTO source_assets (
+            id, absolute_path, file_name, relative_folder, source_group, source_identifier,
+            kind, status, size_bytes, modified_unix_ms, quick_fingerprint, sha256, width,
+            height, duration_ms, codec, frame_rate, capture_time, capture_time_source,
+            orientation, thumbnail_path, error, imported_at, last_checked_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+        ) ON CONFLICT(id) DO UPDATE SET
+            absolute_path=excluded.absolute_path, file_name=excluded.file_name,
+            relative_folder=excluded.relative_folder,
+            source_group=excluded.source_group, source_identifier=excluded.source_identifier,
+            kind=excluded.kind, status=excluded.status, size_bytes=excluded.size_bytes,
+            modified_unix_ms=excluded.modified_unix_ms,
+            quick_fingerprint=excluded.quick_fingerprint,
+            sha256=COALESCE(excluded.sha256, source_assets.sha256), width=excluded.width,
+            height=excluded.height, duration_ms=excluded.duration_ms, codec=excluded.codec,
+            frame_rate=excluded.frame_rate, capture_time=excluded.capture_time,
+            capture_time_source=excluded.capture_time_source, orientation=excluded.orientation,
+            thumbnail_path=excluded.thumbnail_path, error=excluded.error,
+            last_checked_at=excluded.last_checked_at"#,
+        params![
+            asset.id,
+            asset.absolute_path,
+            asset.file_name,
+            asset.relative_folder,
+            asset.source_group,
+            asset.source_identifier,
+            kind_text(asset.kind),
+            status_text(asset.status),
+            asset.size_bytes,
+            asset.modified_unix_ms,
+            asset.quick_fingerprint,
+            asset.sha256,
+            asset.width,
+            asset.height,
+            asset.duration_ms,
+            asset.codec,
+            asset.frame_rate,
+            asset.capture_time,
+            asset.capture_time_source,
+            asset.orientation,
+            asset.thumbnail_path,
+            asset.error,
+            asset.imported_at,
+            asset.last_checked_at,
+        ],
+    )?;
+    Ok(existed)
 }
 
 fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSourceAsset> {

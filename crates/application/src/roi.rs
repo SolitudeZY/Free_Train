@@ -59,7 +59,7 @@ pub fn list_effective_roi_profiles(
         profiles.insert(profile.name.to_ascii_lowercase(), profile);
     }
     let mut result = profiles.into_values().collect::<Vec<_>>();
-    result.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    result.sort_by_key(|item| item.name.to_lowercase());
     Ok(result)
 }
 
