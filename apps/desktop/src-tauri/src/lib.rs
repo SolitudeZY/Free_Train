@@ -5,9 +5,10 @@ use std::{
 };
 
 use application::{
-    CandidateDeletionResult, CaptureResult, ChangeAnalysisResult, ComponentHealth, ExportPlan,
-    ExportRequest, ExportResult, GroupSamplingEstimate, ImportProgress, ImportResult, M0Status,
-    OperationControl, OperationProgress, OperationState, ProjectSession, ProjectSummary,
+    ApplicationError, AugmentationPreview, AugmentationPreviewRequest, CandidateDeletionResult,
+    CaptureResult, ChangeAnalysisResult, ComponentHealth, ExportPlan, ExportRequest, ExportResult,
+    GroupSamplingEstimate, ImportProgress, ImportResult, M0Status, OperationControl,
+    OperationProgress, OperationState, PrepareImagesResult, ProjectSession, ProjectSummary,
     ReviewAction, ReviewAnalysisConfig, ReviewWorkspace, RoiProfile, SamplingConfig,
     SamplingEstimate, SamplingExecutionResult, SaveRoiProfile, SourceDeletionProgress,
     SourceDeletionResult, TilePreview, VideoPreview, analyze_changes, capture_manual_frame,
@@ -17,21 +18,24 @@ use application::{
     delete_sources_with_control as delete_project_sources_with_control, delete_video_selection,
     estimate_group_sampling, estimate_sampling, execute_group_sampling_with_control,
     execute_sampling_with_control, execute_video_preview,
+    generate_augmentation_previews as generate_project_augmentation_previews,
     import_sources_with_control as import_project_sources_with_control,
     list_all_source_ids as list_project_source_ids, list_candidates as list_project_candidates,
-    list_effective_roi_profiles, list_review_workspace_at as list_project_review_workspace_at,
+    list_effective_roi_profiles,
+    list_review_workspace_at_for_sources as list_project_review_workspace_at_for_sources,
     list_sources as list_project_sources, list_video_selections,
-    plan_export as plan_project_export, plan_video_preview, preview_source_tiles,
-    read_recent_project, redo_review_action as redo_project_review_action,
+    plan_export as plan_project_export, plan_video_preview, prepare_review_images_with_control,
+    preview_source_tiles, read_recent_project, redo_review_action as redo_project_review_action,
     refresh_source_status as refresh_project_source_status, refresh_source_statuses,
     relink_source as relink_project_source,
     run_export_with_control as run_project_export_with_control,
-    run_review_analysis_at as run_project_review_analysis_at,
+    run_review_analysis_at_for_sources_with_control as run_project_review_analysis_at_for_sources_with_control,
+    run_review_analysis_at_with_control as run_project_review_analysis_at_with_control,
     save_roi_profile as save_project_roi_profile, undo_review_action as undo_project_review_action,
     update_review_items as update_project_review_items, video_frame_timestamps,
     write_recent_project,
 };
-use domain::{EdgeStrategy, JobState, Roi, TileConfig};
+use domain::{EdgeStrategy, JobState, Roi, SourceKind, TileConfig};
 use image::{DynamicImage, ImageBuffer, Luma};
 use image_pipeline::{deterministic_brightness, global_ssim, perceptual_hash, plan_tiles};
 use job_engine::JobStateMachine;
@@ -43,6 +47,16 @@ use tauri::{AppHandle, Emitter, Manager, State};
 struct VideoPreviewProgress {
     source_id: String,
     percent: u8,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickProcessResult {
+    workspace: Option<ReviewWorkspace>,
+    sampled: u64,
+    prepared: u64,
+    reused: u64,
+    cancelled: bool,
 }
 
 #[derive(Clone)]
@@ -517,22 +531,195 @@ async fn remove_sources(
 
 #[tauri::command]
 async fn run_review_analysis(
+    app: AppHandle,
     state: State<'_, AppState>,
     config: ReviewAnalysisConfig,
 ) -> Result<ReviewWorkspace, String> {
-    let database_path = current_project_database(state.inner())?;
+    let state = state.inner().clone();
+    let database_path = current_project_database(&state)?;
+    let control = begin_operation(&state, "review")?;
+    let operation_state = state.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        run_project_review_analysis_at(database_path, &config).map_err(error_text)
+        let outcome = run_project_review_analysis_at_with_control(
+            database_path,
+            &config,
+            Some(&control),
+            |progress| {
+                let _ = app.emit("review-progress", progress);
+            },
+        )
+        .map_err(error_text);
+        finish_operation(&operation_state, "review");
+        outcome
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-async fn get_review_workspace(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+async fn run_quick_process(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_ids: Vec<String>,
+    sampling_config: SamplingConfig,
+    review_config: ReviewAnalysisConfig,
+) -> Result<QuickProcessResult, String> {
+    let state = state.inner().clone();
+    let control = begin_operation(&state, "quick_process")?;
+    let operation_state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = (|| {
+            let ffprobe = external_tool(&app, "ffprobe");
+            let ffmpeg = external_tool(&app, "ffmpeg");
+            let mut sampled = 0_u64;
+            let mut guard = state.session.lock().map_err(lock_error)?;
+            let session = guard.as_mut().ok_or_else(no_project)?;
+            let selected = list_project_sources(session, 0, 100_000)
+                .map_err(error_text)?
+                .into_iter()
+                .filter(|source| source_ids.is_empty() || source_ids.contains(&source.id))
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err("快速处理范围内没有素材".to_owned());
+            }
+            let videos = selected
+                .iter()
+                .filter(|source| source.kind == SourceKind::Video)
+                .collect::<Vec<_>>();
+            for (index, source) in videos.iter().enumerate() {
+                if !control.checkpoint() {
+                    return Ok(QuickProcessResult {
+                        workspace: None,
+                        sampled,
+                        prepared: 0,
+                        reused: 0,
+                        cancelled: true,
+                    });
+                }
+                if list_project_candidates(session, &source.id, 0, 1)
+                    .map_err(error_text)?
+                    .is_empty()
+                {
+                    let source_name = source.file_name.clone();
+                    let result = execute_sampling_with_control(
+                        session,
+                        &source.id,
+                        &sampling_config,
+                        &ffprobe,
+                        &ffmpeg,
+                        Some(&control),
+                        |mut progress: OperationProgress| {
+                            progress.phase = format!(
+                                "快速处理 1/3：抽帧 {} ({}/{}) · {}",
+                                source_name,
+                                index + 1,
+                                videos.len(),
+                                progress.phase
+                            );
+                            let _ = app.emit("quick-process-progress", progress);
+                        },
+                    )
+                    .map_err(error_text)?;
+                    sampled += result.created;
+                    if result.cancelled {
+                        return Ok(QuickProcessResult {
+                            workspace: None,
+                            sampled,
+                            prepared: 0,
+                            reused: 0,
+                            cancelled: true,
+                        });
+                    }
+                }
+            }
+            let prepared: PrepareImagesResult = prepare_review_images_with_control(
+                session,
+                &source_ids,
+                Some(&control),
+                |mut progress| {
+                    progress.phase = format!("快速处理 2/3：{}", progress.phase);
+                    let _ = app.emit("quick-process-progress", progress);
+                },
+            )
+            .map_err(error_text)?;
+            if prepared.cancelled || !control.checkpoint() {
+                return Ok(QuickProcessResult {
+                    workspace: None,
+                    sampled,
+                    prepared: prepared.prepared,
+                    reused: prepared.reused,
+                    cancelled: true,
+                });
+            }
+            let database_path = session.database_path();
+            drop(guard);
+            let _ = app.emit(
+                "quick-process-progress",
+                OperationProgress {
+                    phase: "快速处理 3/3：质量与相似分析".to_owned(),
+                    completed: 0,
+                    total: 1,
+                    succeeded: 0,
+                    existing: 0,
+                    failed: 0,
+                },
+            );
+            let workspace = match run_project_review_analysis_at_for_sources_with_control(
+                database_path,
+                &review_config,
+                &source_ids,
+                Some(&control),
+                |mut progress| {
+                    progress.phase = format!("快速处理 3/3：{}", progress.phase);
+                    let _ = app.emit("quick-process-progress", progress);
+                },
+            ) {
+                Ok(workspace) => workspace,
+                Err(ApplicationError::OperationCancelled) => {
+                    return Ok(QuickProcessResult {
+                        workspace: None,
+                        sampled,
+                        prepared: prepared.prepared,
+                        reused: prepared.reused,
+                        cancelled: true,
+                    });
+                }
+                Err(error) => return Err(error_text(error)),
+            };
+            let _ = app.emit(
+                "quick-process-progress",
+                OperationProgress {
+                    phase: "快速处理完成，等待人工审核".to_owned(),
+                    completed: 1,
+                    total: 1,
+                    succeeded: workspace.summary.total,
+                    existing: prepared.reused,
+                    failed: prepared.failures.len() as u64,
+                },
+            );
+            Ok(QuickProcessResult {
+                workspace: Some(workspace),
+                sampled,
+                prepared: prepared.prepared,
+                reused: prepared.reused,
+                cancelled: false,
+            })
+        })();
+        finish_operation(&operation_state, "quick_process");
+        outcome
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn get_review_workspace(
+    state: State<'_, AppState>,
+    source_ids: Vec<String>,
+) -> Result<ReviewWorkspace, String> {
     let database_path = current_project_database(state.inner())?;
     tauri::async_runtime::spawn_blocking(move || {
-        list_project_review_workspace_at(database_path).map_err(error_text)
+        list_project_review_workspace_at_for_sources(database_path, &source_ids).map_err(error_text)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -543,29 +730,42 @@ async fn update_review_items(
     state: State<'_, AppState>,
     asset_keys: Vec<String>,
     action: ReviewAction,
+    source_ids: Vec<String>,
 ) -> Result<ReviewWorkspace, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = state.session.lock().map_err(lock_error)?;
         let session = guard.as_ref().ok_or_else(no_project)?;
-        update_project_review_items(session, &asset_keys, action).map_err(error_text)
+        update_project_review_items(session, &asset_keys, action).map_err(error_text)?;
+        list_project_review_workspace_at_for_sources(session.database_path(), &source_ids)
+            .map_err(error_text)
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn undo_review_action(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+fn undo_review_action(
+    state: State<'_, AppState>,
+    source_ids: Vec<String>,
+) -> Result<ReviewWorkspace, String> {
     let guard = state.session.lock().map_err(lock_error)?;
     let session = guard.as_ref().ok_or_else(no_project)?;
-    undo_project_review_action(session).map_err(error_text)
+    undo_project_review_action(session).map_err(error_text)?;
+    list_project_review_workspace_at_for_sources(session.database_path(), &source_ids)
+        .map_err(error_text)
 }
 
 #[tauri::command]
-fn redo_review_action(state: State<'_, AppState>) -> Result<ReviewWorkspace, String> {
+fn redo_review_action(
+    state: State<'_, AppState>,
+    source_ids: Vec<String>,
+) -> Result<ReviewWorkspace, String> {
     let guard = state.session.lock().map_err(lock_error)?;
     let session = guard.as_ref().ok_or_else(no_project)?;
-    redo_project_review_action(session).map_err(error_text)
+    redo_project_review_action(session).map_err(error_text)?;
+    list_project_review_workspace_at_for_sources(session.database_path(), &source_ids)
+        .map_err(error_text)
 }
 
 #[tauri::command]
@@ -782,6 +982,28 @@ async fn preview_tiles(
 }
 
 #[tauri::command]
+async fn generate_augmentation_previews(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: AugmentationPreviewRequest,
+) -> Result<Vec<AugmentationPreview>, String> {
+    let state = state.inner().clone();
+    let previews = tauri::async_runtime::spawn_blocking(move || {
+        let guard = state.session.lock().map_err(lock_error)?;
+        let session = guard.as_ref().ok_or_else(no_project)?;
+        generate_project_augmentation_previews(session, &request).map_err(error_text)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    for preview in &previews {
+        app.asset_protocol_scope()
+            .allow_file(PathBuf::from(&preview.image_path))
+            .map_err(error_text)?;
+    }
+    Ok(previews)
+}
+
+#[tauri::command]
 fn plan_export(state: State<'_, AppState>, request: ExportRequest) -> Result<ExportPlan, String> {
     let guard = state.session.lock().map_err(lock_error)?;
     let session = guard.as_ref().ok_or_else(no_project)?;
@@ -951,6 +1173,7 @@ pub fn run() {
             remove_candidates,
             remove_sources,
             run_review_analysis,
+            run_quick_process,
             get_review_workspace,
             update_review_items,
             undo_review_action,
@@ -965,6 +1188,7 @@ pub fn run() {
             get_roi_profiles,
             delete_roi_profile,
             preview_tiles,
+            generate_augmentation_previews,
             plan_export,
             run_export,
         ])

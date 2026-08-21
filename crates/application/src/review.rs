@@ -5,6 +5,7 @@ struct ReviewAnalysisInput {
     asset_key: String,
     source: StoredSourceAsset,
     candidate: Option<StoredCandidateImage>,
+    prepared: Option<StoredPreparedImage>,
     image_path: String,
     video_offset_ms: Option<u64>,
     pinned: bool,
@@ -26,20 +27,81 @@ pub fn run_review_analysis_at(
     database_path: impl AsRef<Path>,
     config: &ReviewAnalysisConfig,
 ) -> Result<ReviewWorkspace, ApplicationError> {
+    run_review_analysis_at_with_control(database_path, config, None, |_| {})
+}
+
+pub fn run_review_analysis_at_with_control<F>(
+    database_path: impl AsRef<Path>,
+    config: &ReviewAnalysisConfig,
+    control: Option<&OperationControl>,
+    report_progress: F,
+) -> Result<ReviewWorkspace, ApplicationError>
+where
+    F: FnMut(OperationProgress),
+{
+    run_review_analysis_at_for_sources_with_control(
+        database_path,
+        config,
+        &[],
+        control,
+        report_progress,
+    )
+}
+
+pub fn run_review_analysis_at_for_sources_with_control<F>(
+    database_path: impl AsRef<Path>,
+    config: &ReviewAnalysisConfig,
+    source_ids: &[String],
+    control: Option<&OperationControl>,
+    mut report_progress: F,
+) -> Result<ReviewWorkspace, ApplicationError>
+where
+    F: FnMut(OperationProgress),
+{
     validate_review_config(config)?;
     let database_path = database_path.as_ref();
     let store = ProjectStore::open(database_path)?;
-    store.reset_review_analysis()?;
-    let sources = store.list_sources(0, 10_000)?;
+    store.reset_review_analysis_for_sources(source_ids)?;
+    let source_filter = source_ids.iter().collect::<HashSet<_>>();
+    let sources = store
+        .list_sources(0, 100_000)?
+        .into_iter()
+        .filter(|source| source_filter.is_empty() || source_filter.contains(&source.id))
+        .collect::<Vec<_>>();
+    let mut prepared_by_source = HashMap::<String, Vec<StoredPreparedImage>>::new();
+    for prepared in store.list_prepared_images()? {
+        prepared_by_source
+            .entry(prepared.source_id.clone())
+            .or_default()
+            .push(prepared);
+    }
     let analyzed_at = Utc::now().to_rfc3339();
     let mut inputs = Vec::new();
     for source in sources {
         if source.status != SourceStatus::Online {
             continue;
         }
-        if source.kind == SourceKind::Image {
+        if let Some(prepared) = prepared_by_source.remove(&source.id) {
+            for prepared in prepared {
+                let candidate = prepared
+                    .candidate_id
+                    .as_deref()
+                    .map(|id| store.get_candidate(id))
+                    .transpose()?
+                    .flatten();
+                let image_path = prepared.image_path.clone();
+                inputs.push(analyze_review_input(
+                    &source,
+                    candidate,
+                    Some(prepared),
+                    &image_path,
+                    config,
+                ));
+            }
+        } else if source.kind == SourceKind::Image {
             inputs.push(analyze_review_input(
                 &source,
+                None,
                 None,
                 &source.absolute_path,
                 config,
@@ -50,6 +112,7 @@ pub fn run_review_analysis_at(
                 inputs.push(analyze_review_input(
                     &source,
                     Some(candidate),
+                    None,
                     &image_path,
                     config,
                 ));
@@ -60,7 +123,12 @@ pub fn run_review_analysis_at(
         return Err(ApplicationError::NoReviewAssets);
     }
 
-    for input in &inputs {
+    let total = inputs.len() as u64;
+    report_progress(review_progress("正在测量质量", 0, total, 0));
+    for (index, input) in inputs.iter().enumerate() {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            return Err(ApplicationError::OperationCancelled);
+        }
         let metrics = input.metrics.unwrap_or(QualityMetrics {
             width: 0,
             height: 0,
@@ -118,10 +186,18 @@ pub fn run_review_analysis_at(
             locked_conflict: false,
             updated_at: analyzed_at.clone(),
         })?;
+        report_progress(review_progress(
+            "正在测量质量",
+            index as u64 + 1,
+            total,
+            index as u64 + 1,
+        ));
     }
 
-    assign_similarity_groups(&store, &mut inputs, config, &analyzed_at)?;
-    list_review_workspace_at(database_path)
+    report_progress(review_progress("正在生成相似组", 0, total, 0));
+    assign_similarity_groups(&store, &mut inputs, config, &analyzed_at, control)?;
+    report_progress(review_progress("审核分析完成", total, total, total));
+    list_review_workspace_at_for_sources(database_path, source_ids)
 }
 
 pub fn list_review_workspace(
@@ -133,9 +209,17 @@ pub fn list_review_workspace(
 pub fn list_review_workspace_at(
     database_path: impl AsRef<Path>,
 ) -> Result<ReviewWorkspace, ApplicationError> {
+    list_review_workspace_at_for_sources(database_path, &[])
+}
+
+pub fn list_review_workspace_at_for_sources(
+    database_path: impl AsRef<Path>,
+    source_ids: &[String],
+) -> Result<ReviewWorkspace, ApplicationError> {
     let store = ProjectStore::open(database_path)?;
+    let source_filter = source_ids.iter().collect::<HashSet<_>>();
     let sources = store
-        .list_sources(0, 10_000)?
+        .list_sources(0, 100_000)?
         .into_iter()
         .map(|source| (source.id.clone(), source))
         .collect::<HashMap<_, _>>();
@@ -144,8 +228,16 @@ pub fn list_review_workspace_at(
         .into_iter()
         .map(|quality| (quality.asset_key.clone(), quality))
         .collect::<HashMap<_, _>>();
+    let prepared = store
+        .list_prepared_images()?
+        .into_iter()
+        .map(|image| (image.asset_key.clone(), image))
+        .collect::<HashMap<_, _>>();
     let mut items = Vec::new();
     for state in store.list_review_assets()? {
+        if !source_filter.is_empty() && !source_filter.contains(&state.source_id) {
+            continue;
+        }
         let Some(source) = sources.get(&state.source_id) else {
             continue;
         };
@@ -156,6 +248,7 @@ pub fn list_review_workspace_at(
             .transpose()?
             .flatten();
         let quality = qualities.get(&state.asset_key);
+        let prepared_image = prepared.get(&state.asset_key);
         let metrics = quality.map(|quality| QualityMetrics {
             width: quality.width,
             height: quality.height,
@@ -168,27 +261,58 @@ pub fn list_review_workspace_at(
         });
         items.push(ReviewItem {
             asset_key: state.asset_key,
+            asset_kind: if prepared_image.is_some() {
+                "prepared".to_owned()
+            } else if candidate.is_some() {
+                "candidate".to_owned()
+            } else {
+                "source".to_owned()
+            },
             source_id: source.id.clone(),
             candidate_id: candidate.as_ref().map(|candidate| candidate.id.clone()),
+            roi_name: prepared_image.map(|image| image.roi_name.clone()),
+            tile_row: prepared_image.map(|image| image.tile_row),
+            tile_column: prepared_image.map(|image| image.tile_column),
             source_group: source.source_group.clone(),
             source_identifier: source.source_identifier.clone(),
-            display_name: candidate
-                .as_ref()
-                .map(|candidate| {
+            display_name: prepared_image
+                .map(|image| {
+                    let frame = candidate
+                        .as_ref()
+                        .map(|candidate| {
+                            format!(" · {}", format_review_time(candidate.video_offset_ms))
+                        })
+                        .unwrap_or_default();
                     format!(
-                        "{} · {}",
-                        source.file_name,
-                        format_review_time(candidate.video_offset_ms)
+                        "{}{} · {} r{} c{}",
+                        source.file_name, frame, image.roi_name, image.tile_row, image.tile_column
                     )
                 })
+                .or_else(|| {
+                    candidate.as_ref().map(|candidate| {
+                        format!(
+                            "{} · {}",
+                            source.file_name,
+                            format_review_time(candidate.video_offset_ms)
+                        )
+                    })
+                })
                 .unwrap_or_else(|| source.file_name.clone()),
-            image_path: candidate
-                .as_ref()
-                .map(|candidate| candidate.image_path.clone())
+            image_path: prepared_image
+                .map(|image| image.image_path.clone())
+                .or_else(|| {
+                    candidate
+                        .as_ref()
+                        .map(|candidate| candidate.image_path.clone())
+                })
                 .unwrap_or_else(|| source.absolute_path.clone()),
-            thumbnail_path: candidate
-                .as_ref()
-                .map(|candidate| candidate.thumbnail_path.clone())
+            thumbnail_path: prepared_image
+                .map(|image| image.thumbnail_path.clone())
+                .or_else(|| {
+                    candidate
+                        .as_ref()
+                        .map(|candidate| candidate.thumbnail_path.clone())
+                })
                 .or_else(|| source.thumbnail_path.clone())
                 .unwrap_or_else(|| source.absolute_path.clone()),
             video_offset_ms: candidate
@@ -392,12 +516,18 @@ fn apply_review_audit_snapshot(
 fn analyze_review_input(
     source: &StoredSourceAsset,
     candidate: Option<StoredCandidateImage>,
+    prepared: Option<StoredPreparedImage>,
     image_path: &str,
     config: &ReviewAnalysisConfig,
 ) -> ReviewAnalysisInput {
-    let asset_key = candidate
+    let asset_key = prepared
         .as_ref()
-        .map(|candidate| format!("candidate:{}", candidate.id))
+        .map(|prepared| prepared.asset_key.clone())
+        .or_else(|| {
+            candidate
+                .as_ref()
+                .map(|candidate| format!("candidate:{}", candidate.id))
+        })
         .unwrap_or_else(|| format!("source:{}", source.id));
     let pinned = candidate.as_ref().is_some_and(|candidate| candidate.pinned);
     let video_offset_ms = candidate
@@ -426,6 +556,7 @@ fn analyze_review_input(
                 asset_key,
                 source: source.clone(),
                 candidate,
+                prepared,
                 image_path: image_path.to_owned(),
                 video_offset_ms,
                 pinned,
@@ -440,6 +571,7 @@ fn analyze_review_input(
             asset_key,
             source: source.clone(),
             candidate,
+            prepared,
             image_path: image_path.to_owned(),
             video_offset_ms,
             pinned,
@@ -457,6 +589,7 @@ fn assign_similarity_groups(
     inputs: &mut [ReviewAnalysisInput],
     config: &ReviewAnalysisConfig,
     analyzed_at: &str,
+    control: Option<&OperationControl>,
 ) -> Result<(), ApplicationError> {
     let valid = inputs
         .iter()
@@ -476,14 +609,36 @@ fn assign_similarity_groups(
         }
     }
     for members in exact.values().filter(|members| members.len() > 1) {
-        for pair in members.windows(2) {
-            union_review(&mut parents, pair[0], pair[1]);
-            edge_scores.insert(ordered_pair(pair[0], pair[1]), 1.0);
+        let mut partitions = HashMap::<String, Vec<usize>>::new();
+        for &index in members {
+            partitions
+                .entry(exact_duplicate_partition_key(
+                    &inputs[index],
+                    config.similarity_scope,
+                ))
+                .or_default()
+                .push(index);
+        }
+        for partition in partitions.values_mut() {
+            partition.sort_by_key(|index| inputs[*index].video_offset_ms);
+            for pair in partition.windows(2) {
+                if !outside_video_window(
+                    &inputs[pair[0]],
+                    &inputs[pair[1]],
+                    config.video_time_window_ms,
+                ) {
+                    union_review(&mut parents, pair[0], pair[1]);
+                    edge_scores.insert(ordered_pair(pair[0], pair[1]), 1.0);
+                }
+            }
         }
     }
 
     let mut comparisons = 0_u64;
     for (position, &left_index) in valid.iter().enumerate() {
+        if control.is_some_and(|control| !control.checkpoint()) {
+            return Err(ApplicationError::OperationCancelled);
+        }
         for &right_index in valid.iter().skip(position + 1) {
             let left = &inputs[left_index];
             let right = &inputs[right_index];
@@ -632,10 +787,48 @@ fn same_similarity_partition(
     right: &ReviewAnalysisInput,
     scope: SimilarityScope,
 ) -> bool {
+    let same_tile_position = match (&left.prepared, &right.prepared) {
+        (Some(left), Some(right)) => {
+            left.roi_name == right.roi_name
+                && left.tile_row == right.tile_row
+                && left.tile_column == right.tile_column
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !same_tile_position {
+        return false;
+    }
     match scope {
         SimilarityScope::Source => left.source.id == right.source.id,
         SimilarityScope::SourceGroup => left.source.source_group == right.source.source_group,
         SimilarityScope::Project => true,
+    }
+}
+
+fn exact_duplicate_partition_key(input: &ReviewAnalysisInput, scope: SimilarityScope) -> String {
+    let Some(prepared) = &input.prepared else {
+        return "original".to_owned();
+    };
+    let scope_key = match scope {
+        SimilarityScope::Source => input.source.id.as_str(),
+        SimilarityScope::SourceGroup => input.source.source_group.as_str(),
+        SimilarityScope::Project => "project",
+    };
+    format!(
+        "prepared:{scope_key}:{}:{}:{}",
+        prepared.roi_name, prepared.tile_row, prepared.tile_column
+    )
+}
+
+fn review_progress(phase: &str, completed: u64, total: u64, succeeded: u64) -> OperationProgress {
+    OperationProgress {
+        phase: phase.to_owned(),
+        completed,
+        total,
+        succeeded,
+        existing: 0,
+        failed: 0,
     }
 }
 

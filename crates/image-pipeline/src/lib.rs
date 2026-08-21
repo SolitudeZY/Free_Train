@@ -7,7 +7,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rustdct::DctPlanner;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, io::Cursor};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io::Cursor,
+};
 use thiserror::Error;
 
 const PHASH_SAMPLE_SIZE: usize = 32;
@@ -598,12 +601,194 @@ pub fn deterministic_brightness(
     Ok((image.brighten(offset), offset))
 }
 
+pub const AUGMENTATION_RECIPE_SCHEMA_VERSION: u32 = 1;
+pub const RUST_AUGMENTATION_EXECUTOR_VERSION: &str = "rust-basic-v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AugmentationRecipe {
+    pub id: String,
+    pub name: String,
+    pub schema_version: u32,
+    pub base_seed: u64,
+    pub variant_count: u32,
+    pub operations: Vec<AugmentationOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AugmentationOperation {
+    Brightness {
+        enabled: bool,
+        probability: f64,
+        min_offset: i32,
+        max_offset: i32,
+    },
+    Contrast {
+        enabled: bool,
+        probability: f64,
+        min_percent: f32,
+        max_percent: f32,
+    },
+    HorizontalFlip {
+        enabled: bool,
+        probability: f64,
+    },
+    Rotate90 {
+        enabled: bool,
+        probability: f64,
+        clockwise: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedAugmentation {
+    pub operation: String,
+    pub applied: bool,
+    pub parameters: BTreeMap<String, String>,
+}
+
+impl AugmentationRecipe {
+    pub fn validate(&self) -> Result<(), PipelineError> {
+        if self.schema_version != AUGMENTATION_RECIPE_SCHEMA_VERSION
+            || self.name.trim().is_empty()
+            || !(1..=16).contains(&self.variant_count)
+            || self.operations.len() > 32
+        {
+            return Err(PipelineError::InvalidAugmentationRecipe);
+        }
+        for operation in &self.operations {
+            let probability = match operation {
+                AugmentationOperation::Brightness {
+                    probability,
+                    min_offset,
+                    max_offset,
+                    ..
+                } => {
+                    if min_offset > max_offset
+                        || !(-255..=255).contains(min_offset)
+                        || !(-255..=255).contains(max_offset)
+                    {
+                        return Err(PipelineError::InvalidAugmentationRecipe);
+                    }
+                    *probability
+                }
+                AugmentationOperation::Contrast {
+                    probability,
+                    min_percent,
+                    max_percent,
+                    ..
+                } => {
+                    if !min_percent.is_finite()
+                        || !max_percent.is_finite()
+                        || min_percent > max_percent
+                        || *min_percent < -100.0
+                        || *max_percent > 100.0
+                    {
+                        return Err(PipelineError::InvalidAugmentationRecipe);
+                    }
+                    *probability
+                }
+                AugmentationOperation::HorizontalFlip { probability, .. }
+                | AugmentationOperation::Rotate90 { probability, .. } => *probability,
+            };
+            if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+                return Err(PipelineError::InvalidAugmentationRecipe);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn execute_augmentation_recipe(
+    image: &DynamicImage,
+    recipe: &AugmentationRecipe,
+    seed: u64,
+) -> Result<(DynamicImage, Vec<AppliedAugmentation>), PipelineError> {
+    recipe.validate()?;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut output = image.clone();
+    let mut applied = Vec::with_capacity(recipe.operations.len());
+    for operation in &recipe.operations {
+        let (name, enabled, probability) = match operation {
+            AugmentationOperation::Brightness {
+                enabled,
+                probability,
+                ..
+            } => ("brightness", *enabled, *probability),
+            AugmentationOperation::Contrast {
+                enabled,
+                probability,
+                ..
+            } => ("contrast", *enabled, *probability),
+            AugmentationOperation::HorizontalFlip {
+                enabled,
+                probability,
+            } => ("horizontal_flip", *enabled, *probability),
+            AugmentationOperation::Rotate90 {
+                enabled,
+                probability,
+                ..
+            } => ("rotate_90", *enabled, *probability),
+        };
+        let should_apply = enabled && rng.random::<f64>() < probability;
+        let mut parameters = BTreeMap::new();
+        if should_apply {
+            match operation {
+                AugmentationOperation::Brightness {
+                    min_offset,
+                    max_offset,
+                    ..
+                } => {
+                    let value = rng.random_range(*min_offset..=*max_offset);
+                    output = output.brighten(value);
+                    parameters.insert("offset".to_owned(), value.to_string());
+                }
+                AugmentationOperation::Contrast {
+                    min_percent,
+                    max_percent,
+                    ..
+                } => {
+                    let value = rng.random_range(*min_percent..=*max_percent);
+                    output = output.adjust_contrast(value);
+                    parameters.insert("percent".to_owned(), format!("{value:.4}"));
+                }
+                AugmentationOperation::HorizontalFlip { .. } => output = output.fliph(),
+                AugmentationOperation::Rotate90 { clockwise, .. } => {
+                    output = if *clockwise {
+                        output.rotate90()
+                    } else {
+                        output.rotate270()
+                    };
+                    parameters.insert(
+                        "degrees".to_owned(),
+                        if *clockwise { "90" } else { "-90" }.to_owned(),
+                    );
+                }
+            }
+        }
+        applied.push(AppliedAugmentation {
+            operation: name.to_owned(),
+            applied: should_apply,
+            parameters,
+        });
+    }
+    Ok((output, applied))
+}
+
 #[derive(Debug, Error)]
 pub enum PipelineError {
     #[error(transparent)]
     Domain(#[from] domain::DomainError),
     #[error("brightness minimum must not exceed maximum")]
     InvalidBrightnessRange,
+    #[error("augmentation recipe is invalid or uses an unsupported schema version")]
+    InvalidAugmentationRecipe,
     #[error("image encoding failed: {0}")]
     Encode(String),
     #[error("file name is empty or invalid")]
@@ -670,11 +855,91 @@ mod tests {
     }
 
     #[test]
+    fn reports_golden_quality_metrics_for_fixed_gradient() {
+        let image = gradient();
+        let metrics = measure_quality(&image);
+        assert_eq!(metrics.width, 64);
+        assert_eq!(metrics.height, 64);
+        assert_eq!(metrics.aspect_ratio, 1.0);
+        assert_eq!(metrics.sharpness, 0.0);
+        assert!((metrics.underexposed_ratio - 0.037_353_515_625).abs() < 1e-12);
+        assert_eq!(metrics.overexposed_ratio, 0.0);
+        assert!((metrics.entropy - 6.720_928_146_743_506).abs() < 1e-12);
+        assert!((metrics.low_information - 0.289_459_251_432_320_1).abs() < 1e-12);
+        assert!((global_ssim(&image, &image.brighten(8)) - 0.992_927_389_935_19).abs() < 1e-12);
+    }
+
+    #[test]
     fn deterministic_augmentation_reuses_the_same_parameter() {
         let image = gradient();
         let (_, first) = deterministic_brightness(&image, 42, -20, 20).unwrap();
         let (_, second) = deterministic_brightness(&image, 42, -20, 20).unwrap();
         assert_eq!(first, second);
+    }
+
+    fn augmentation_recipe() -> AugmentationRecipe {
+        AugmentationRecipe {
+            id: "recipe-1".to_owned(),
+            name: "基础增强".to_owned(),
+            schema_version: AUGMENTATION_RECIPE_SCHEMA_VERSION,
+            base_seed: 42,
+            variant_count: 2,
+            operations: vec![
+                AugmentationOperation::Brightness {
+                    enabled: true,
+                    probability: 1.0,
+                    min_offset: -20,
+                    max_offset: 20,
+                },
+                AugmentationOperation::Contrast {
+                    enabled: true,
+                    probability: 1.0,
+                    min_percent: -10.0,
+                    max_percent: 10.0,
+                },
+                AugmentationOperation::HorizontalFlip {
+                    enabled: true,
+                    probability: 0.5,
+                },
+                AugmentationOperation::Rotate90 {
+                    enabled: true,
+                    probability: 0.5,
+                    clockwise: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn augmentation_recipe_is_deterministic_and_records_actual_parameters() {
+        let image = gradient();
+        let recipe = augmentation_recipe();
+        let (first, first_parameters) = execute_augmentation_recipe(&image, &recipe, 2026).unwrap();
+        let (second, second_parameters) =
+            execute_augmentation_recipe(&image, &recipe, 2026).unwrap();
+        assert_eq!(first.to_rgba8(), second.to_rgba8());
+        assert_eq!(first_parameters, second_parameters);
+        assert_eq!(first_parameters.len(), recipe.operations.len());
+        assert!(first_parameters[0].parameters.contains_key("offset"));
+    }
+
+    #[test]
+    fn augmentation_recipe_rejects_invalid_probability_and_version() {
+        let mut recipe = augmentation_recipe();
+        recipe.schema_version = 99;
+        assert!(matches!(
+            recipe.validate(),
+            Err(PipelineError::InvalidAugmentationRecipe)
+        ));
+        recipe.schema_version = AUGMENTATION_RECIPE_SCHEMA_VERSION;
+        recipe.operations = vec![AugmentationOperation::HorizontalFlip {
+            enabled: true,
+            probability: 1.1,
+        }];
+        assert!(matches!(
+            recipe.validate(),
+            Err(PipelineError::InvalidAugmentationRecipe)
+        ));
     }
 
     #[test]

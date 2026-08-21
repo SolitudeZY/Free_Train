@@ -168,6 +168,63 @@ CREATE TABLE IF NOT EXISTS review_redo_events (
 );
 "#;
 
+const MIGRATION_6: &str = r#"
+CREATE TABLE IF NOT EXISTS prepared_images (
+    asset_key TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    candidate_id TEXT,
+    roi_profile_id TEXT NOT NULL,
+    roi_name TEXT NOT NULL,
+    tile_row INTEGER NOT NULL,
+    tile_column INTEGER NOT NULL,
+    image_path TEXT NOT NULL,
+    thumbnail_path TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    parameter_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(source_id) REFERENCES source_assets(id) ON DELETE CASCADE,
+    FOREIGN KEY(candidate_id) REFERENCES candidate_images(id) ON DELETE CASCADE,
+    FOREIGN KEY(roi_profile_id) REFERENCES roi_profiles(id) ON DELETE CASCADE,
+    UNIQUE(source_id, candidate_id, roi_profile_id, tile_row, tile_column, parameter_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_prepared_images_source
+ON prepared_images(source_id, candidate_id, roi_name, tile_row, tile_column);
+"#;
+
+const MIGRATION_7: &str = r#"
+CREATE TABLE IF NOT EXISTS augmentation_recipes (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    recipe_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(schema_version > 0)
+);
+
+CREATE TABLE IF NOT EXISTS augmentation_previews (
+    id TEXT PRIMARY KEY,
+    recipe_id TEXT NOT NULL,
+    input_asset_key TEXT NOT NULL,
+    variant_index INTEGER NOT NULL,
+    seed TEXT NOT NULL,
+    lineage_group_id TEXT NOT NULL,
+    executor_name TEXT NOT NULL,
+    executor_version TEXT NOT NULL,
+    recipe_schema_version INTEGER NOT NULL,
+    applied_parameters_json TEXT NOT NULL,
+    image_path TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(recipe_id) REFERENCES augmentation_recipes(id) ON DELETE CASCADE,
+    FOREIGN KEY(input_asset_key) REFERENCES prepared_images(asset_key) ON DELETE CASCADE,
+    UNIQUE(recipe_id, input_asset_key, variant_index, seed)
+);
+CREATE INDEX IF NOT EXISTS idx_augmentation_previews_input
+ON augmentation_previews(input_asset_key, recipe_id, variant_index);
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageProbe {
     pub sqlite_version: String,
@@ -294,6 +351,53 @@ pub struct StoredReviewAuditEvent {
     pub action: String,
     pub before_json: String,
     pub after_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredPreparedImage {
+    pub asset_key: String,
+    pub source_id: String,
+    pub candidate_id: Option<String>,
+    pub roi_profile_id: String,
+    pub roi_name: String,
+    pub tile_row: u32,
+    pub tile_column: u32,
+    pub image_path: String,
+    pub thumbnail_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub parameter_fingerprint: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredAugmentationRecipe {
+    pub id: String,
+    pub name: String,
+    pub schema_version: u32,
+    pub recipe_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredAugmentationPreview {
+    pub id: String,
+    pub recipe_id: String,
+    pub input_asset_key: String,
+    pub variant_index: u32,
+    pub seed: String,
+    pub lineage_group_id: String,
+    pub executor_name: String,
+    pub executor_version: String,
+    pub recipe_schema_version: u32,
+    pub applied_parameters_json: String,
+    pub image_path: String,
+    pub content_sha256: String,
+    pub created_at: String,
 }
 
 pub struct ProjectStore {
@@ -646,16 +750,15 @@ impl ProjectStore {
     }
 
     pub fn upsert_roi_profile(&self, profile: &StoredRoiProfile) -> Result<(), StorageError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM roi_profiles WHERE id=?1", params![profile.id])?;
-        transaction.execute(
+        self.connection()?.execute(
             r#"INSERT INTO roi_profiles(
                 id, scope_kind, scope_value, name, x, y, width, height,
                 render_config_json, created_at, updated_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(scope_kind, scope_value, name) DO UPDATE SET
-                id=excluded.id,
+            ON CONFLICT DO UPDATE SET
+                scope_kind=excluded.scope_kind,
+                scope_value=excluded.scope_value,
+                name=excluded.name,
                 x=excluded.x,
                 y=excluded.y,
                 width=excluded.width,
@@ -676,7 +779,6 @@ impl ProjectStore {
                 profile.updated_at,
             ],
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -704,6 +806,168 @@ impl ProjectStore {
             > 0)
     }
 
+    pub fn list_prepared_images(&self) -> Result<Vec<StoredPreparedImage>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT asset_key, source_id, candidate_id, roi_profile_id, roi_name,
+                    tile_row, tile_column, image_path, thumbnail_path, width, height,
+                    parameter_fingerprint, created_at
+             FROM prepared_images
+             ORDER BY source_id, candidate_id, roi_name, tile_row, tile_column",
+        )?;
+        let rows = statement.query_map([], row_to_prepared_image)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_augmentation_recipe(
+        &self,
+        recipe: &StoredAugmentationRecipe,
+    ) -> Result<(), StorageError> {
+        self.connection()?.execute(
+            r#"INSERT INTO augmentation_recipes(id, name, schema_version, recipe_json, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name, schema_version=excluded.schema_version,
+                 recipe_json=excluded.recipe_json, updated_at=excluded.updated_at"#,
+            params![recipe.id, recipe.name, recipe.schema_version, recipe.recipe_json, recipe.created_at, recipe.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_augmentation_recipes(&self) -> Result<Vec<StoredAugmentationRecipe>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, schema_version, recipe_json, created_at, updated_at FROM augmentation_recipes ORDER BY updated_at DESC, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredAugmentationRecipe {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                schema_version: row.get(2)?,
+                recipe_json: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn replace_augmentation_previews(
+        &self,
+        recipe_id: &str,
+        input_asset_key: &str,
+        previews: &[StoredAugmentationPreview],
+    ) -> Result<Vec<StoredAugmentationPreview>, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let old = {
+            let mut statement = transaction.prepare(
+                "SELECT id, recipe_id, input_asset_key, variant_index, seed, lineage_group_id, executor_name, executor_version, recipe_schema_version, applied_parameters_json, image_path, content_sha256, created_at FROM augmentation_previews WHERE recipe_id=?1 AND input_asset_key=?2",
+            )?;
+            statement
+                .query_map(
+                    params![recipe_id, input_asset_key],
+                    row_to_augmentation_preview,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.execute(
+            "DELETE FROM augmentation_previews WHERE recipe_id=?1 AND input_asset_key=?2",
+            params![recipe_id, input_asset_key],
+        )?;
+        for preview in previews {
+            transaction.execute(
+                "INSERT INTO augmentation_previews(id, recipe_id, input_asset_key, variant_index, seed, lineage_group_id, executor_name, executor_version, recipe_schema_version, applied_parameters_json, image_path, content_sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![preview.id, preview.recipe_id, preview.input_asset_key, preview.variant_index, preview.seed, preview.lineage_group_id, preview.executor_name, preview.executor_version, preview.recipe_schema_version, preview.applied_parameters_json, preview.image_path, preview.content_sha256, preview.created_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(old)
+    }
+
+    pub fn list_augmentation_previews(
+        &self,
+    ) -> Result<Vec<StoredAugmentationPreview>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, recipe_id, input_asset_key, variant_index, seed, lineage_group_id, executor_name, executor_version, recipe_schema_version, applied_parameters_json, image_path, content_sha256, created_at FROM augmentation_previews ORDER BY input_asset_key, variant_index",
+        )?;
+        let rows = statement.query_map([], row_to_augmentation_preview)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn replace_prepared_images_for_source(
+        &self,
+        source_id: &str,
+        images: &[StoredPreparedImage],
+    ) -> Result<Vec<StoredPreparedImage>, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let old = {
+            let mut statement = transaction.prepare(
+                "SELECT asset_key, source_id, candidate_id, roi_profile_id, roi_name,
+                        tile_row, tile_column, image_path, thumbnail_path, width, height,
+                        parameter_fingerprint, created_at
+                 FROM prepared_images WHERE source_id=?1",
+            )?;
+            statement
+                .query_map(params![source_id], row_to_prepared_image)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let keys = images
+            .iter()
+            .map(|image| image.asset_key.as_str())
+            .collect::<HashSet<_>>();
+        let stale = old
+            .into_iter()
+            .filter(|image| !keys.contains(image.asset_key.as_str()))
+            .collect::<Vec<_>>();
+        for image in &stale {
+            transaction.execute(
+                "DELETE FROM quality_assessments WHERE asset_key=?1",
+                params![image.asset_key],
+            )?;
+            transaction.execute(
+                "DELETE FROM review_assets WHERE asset_key=?1",
+                params![image.asset_key],
+            )?;
+            transaction.execute(
+                "DELETE FROM prepared_images WHERE asset_key=?1",
+                params![image.asset_key],
+            )?;
+        }
+        for image in images {
+            transaction.execute(
+                r#"INSERT INTO prepared_images(
+                    asset_key, source_id, candidate_id, roi_profile_id, roi_name,
+                    tile_row, tile_column, image_path, thumbnail_path, width, height,
+                    parameter_fingerprint, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(asset_key) DO UPDATE SET
+                    image_path=excluded.image_path, thumbnail_path=excluded.thumbnail_path,
+                    width=excluded.width, height=excluded.height,
+                    parameter_fingerprint=excluded.parameter_fingerprint,
+                    created_at=excluded.created_at"#,
+                params![
+                    image.asset_key,
+                    image.source_id,
+                    image.candidate_id,
+                    image.roi_profile_id,
+                    image.roi_name,
+                    image.tile_row,
+                    image.tile_column,
+                    image.image_path,
+                    image.thumbnail_path,
+                    image.width,
+                    image.height,
+                    image.parameter_fingerprint,
+                    image.created_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(stale)
+    }
+
     pub fn reset_review_analysis(&self) -> Result<(), StorageError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -714,6 +978,52 @@ impl ProjectStore {
              locked_conflict=0",
             [],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn reset_review_analysis_for_sources(
+        &self,
+        source_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if source_ids.is_empty() {
+            return self.reset_review_analysis();
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut affected_groups = HashSet::new();
+        for source_id in source_ids.iter().collect::<HashSet<_>>() {
+            let groups = {
+                let mut statement = transaction.prepare(
+                    "SELECT DISTINCT similarity_group_id FROM review_assets
+                     WHERE source_id=?1 AND similarity_group_id IS NOT NULL",
+                )?;
+                statement
+                    .query_map(params![source_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            affected_groups.extend(groups);
+        }
+        for group_id in affected_groups {
+            transaction.execute(
+                "UPDATE review_assets SET automatic_status='keep', automatic_reasons_json='[]',
+                 similarity_group_id=NULL, similarity_score=NULL, representative=0,
+                 locked_conflict=0 WHERE similarity_group_id=?1",
+                params![group_id],
+            )?;
+        }
+        for source_id in source_ids.iter().collect::<HashSet<_>>() {
+            transaction.execute(
+                "DELETE FROM quality_assessments WHERE source_id=?1",
+                params![source_id],
+            )?;
+            transaction.execute(
+                "UPDATE review_assets SET automatic_status='keep', automatic_reasons_json='[]',
+                 similarity_group_id=NULL, similarity_score=NULL, representative=0,
+                 locked_conflict=0 WHERE source_id=?1",
+                params![source_id],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1003,6 +1313,16 @@ fn apply_migrations(connection: &Connection) -> Result<(), StorageError> {
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
         params![5_i64],
     )?;
+    connection.execute_batch(MIGRATION_6)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+        params![6_i64],
+    )?;
+    connection.execute_batch(MIGRATION_7)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
+        params![7_i64],
+    )?;
     Ok(())
 }
 
@@ -1205,6 +1525,44 @@ fn row_to_review_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReview
     })
 }
 
+fn row_to_prepared_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPreparedImage> {
+    Ok(StoredPreparedImage {
+        asset_key: row.get(0)?,
+        source_id: row.get(1)?,
+        candidate_id: row.get(2)?,
+        roi_profile_id: row.get(3)?,
+        roi_name: row.get(4)?,
+        tile_row: row.get(5)?,
+        tile_column: row.get(6)?,
+        image_path: row.get(7)?,
+        thumbnail_path: row.get(8)?,
+        width: row.get(9)?,
+        height: row.get(10)?,
+        parameter_fingerprint: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
+fn row_to_augmentation_preview(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredAugmentationPreview> {
+    Ok(StoredAugmentationPreview {
+        id: row.get(0)?,
+        recipe_id: row.get(1)?,
+        input_asset_key: row.get(2)?,
+        variant_index: row.get(3)?,
+        seed: row.get(4)?,
+        lineage_group_id: row.get(5)?,
+        executor_name: row.get(6)?,
+        executor_version: row.get(7)?,
+        recipe_schema_version: row.get(8)?,
+        applied_parameters_json: row.get(9)?,
+        image_path: row.get(10)?,
+        content_sha256: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
 pub fn probe_in_memory() -> Result<StorageProbe, StorageError> {
     let connection = Connection::open_in_memory()?;
     apply_migrations(&connection)?;
@@ -1232,10 +1590,57 @@ pub enum StorageError {
 mod tests {
     use super::*;
 
+    fn stored_source(id: &str, path: &str) -> StoredSourceAsset {
+        StoredSourceAsset {
+            id: id.to_owned(),
+            absolute_path: path.to_owned(),
+            file_name: "frame.png".to_owned(),
+            relative_folder: String::new(),
+            source_group: "camera-a".to_owned(),
+            source_identifier: "frame".to_owned(),
+            kind: SourceKind::Image,
+            status: SourceStatus::Online,
+            size_bytes: 1,
+            modified_unix_ms: 1,
+            quick_fingerprint: "quick".to_owned(),
+            sha256: None,
+            width: Some(32),
+            height: Some(32),
+            duration_ms: None,
+            codec: None,
+            frame_rate: None,
+            capture_time: None,
+            capture_time_source: None,
+            orientation: None,
+            thumbnail_path: None,
+            error: None,
+            imported_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_checked_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn prepared(asset_key: &str, source_id: &str) -> StoredPreparedImage {
+        StoredPreparedImage {
+            asset_key: asset_key.to_owned(),
+            source_id: source_id.to_owned(),
+            candidate_id: None,
+            roi_profile_id: "roi-1".to_owned(),
+            roi_name: "track".to_owned(),
+            tile_row: 0,
+            tile_column: 0,
+            image_path: format!("{asset_key}.jpg"),
+            thumbnail_path: format!("{asset_key}.thumb.jpg"),
+            width: 32,
+            height: 32,
+            parameter_fingerprint: asset_key.to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
     #[test]
     fn applies_initial_schema() {
         let probe = probe_in_memory().expect("in-memory SQLite should initialize");
-        assert_eq!(probe.schema_version, 5);
+        assert_eq!(probe.schema_version, 7);
         assert!(!probe.sqlite_version.is_empty());
     }
 
@@ -1269,5 +1674,56 @@ mod tests {
         assert_eq!(page.len(), 50);
         assert_eq!(page[0], 99_951);
         assert_eq!(page[49], 100_000);
+    }
+
+    #[test]
+    fn replaces_prepared_images_for_one_source_transactionally() {
+        let database = std::env::temp_dir().join(format!(
+            "free-train-storage-prepared-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&database);
+        let store = ProjectStore::open(&database).unwrap();
+        store
+            .upsert_source(&stored_source("source-1", "C:/fixtures/frame.png"))
+            .unwrap();
+        store
+            .upsert_roi_profile(&StoredRoiProfile {
+                id: "roi-1".to_owned(),
+                scope_kind: "source".to_owned(),
+                scope_value: "source-1".to_owned(),
+                name: "track".to_owned(),
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+                render_config_json: "{}".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .replace_prepared_images_for_source(
+                    "source-1",
+                    &[prepared("prepared:a", "source-1")]
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.list_prepared_images().unwrap().len(), 1);
+        let stale = store
+            .replace_prepared_images_for_source("source-1", &[prepared("prepared:b", "source-1")])
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].asset_key, "prepared:a");
+        assert_eq!(
+            store.list_prepared_images().unwrap()[0].asset_key,
+            "prepared:b"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&database);
     }
 }

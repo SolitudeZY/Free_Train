@@ -4,6 +4,7 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
   import { createVideoSeekCoordinator } from "$lib/video-seek.js";
+  import { calculateReviewWindow } from "$lib/review-virtual.js";
   import {
     Activity,
     AlertCircle,
@@ -47,7 +48,6 @@
     RotateCcw,
     ScanLine,
     Search,
-    Save,
     Settings2,
     SkipBack,
     SkipForward,
@@ -60,6 +60,7 @@
     Undo2,
     Redo2,
     Video,
+    WandSparkles,
     X,
     ZoomIn,
     ZoomOut,
@@ -137,7 +138,7 @@
   type ResizeMode = "stretch" | "fit" | "fill" | "long_side";
   type ExportFormat = "jpeg" | "png" | "webp";
   type ExportContent = "frames" | "tiles";
-  type ExportSourceScope = "current" | "source_group";
+  type ExportSourceScope = "current" | "source_group" | "selected";
   type ExportCandidateScope = "all" | "selected";
   type ExportReviewScope = "eligible" | "all";
   type ConflictStrategy = "append_sequence" | "append_hash" | "skip" | "fail";
@@ -164,7 +165,7 @@
     skipped: number; estimatedBytes: number;
   };
   type ExportResult = { exportId: string; written: number; skipped: number; manifestPath: string; failures: { path: string; error: string }[]; cancelled: boolean };
-  type ControllableOperation = "import" | "source_removal" | "sampling" | "export";
+  type ControllableOperation = "import" | "source_removal" | "sampling" | "export" | "review" | "quick_process";
   type OperationControlState = "running" | "paused" | "cancelling";
   type SimilarityScope = "source" | "source_group" | "project";
   type QualityMetricKey = "sharpness" | "low_information" | "underexposed" | "overexposed" | "resolution";
@@ -174,7 +175,8 @@
     underexposedRatio: number; overexposedRatio: number; entropy: number; lowInformation: number;
   };
   type ReviewItem = {
-    assetKey: string; sourceId: string; candidateId: string | null; sourceGroup: string;
+    assetKey: string; assetKind: "source" | "candidate" | "prepared"; sourceId: string; candidateId: string | null;
+    roiName: string | null; tileRow: number | null; tileColumn: number | null; sourceGroup: string;
     sourceIdentifier: string; displayName: string; imagePath: string; thumbnailPath: string;
     videoOffsetMs: number | null; selectionMethod: string; pinned: boolean; metrics: QualityMetrics | null;
     automaticStatus: "keep" | "suggest_exclude" | "warning" | "error"; automaticReasons: string[];
@@ -186,8 +188,15 @@
     warning: number; failed: number; locked: number; similarityGroups: number;
   };
   type ReviewWorkspace = { items: ReviewItem[]; summary: ReviewSummary; canUndo: boolean; canRedo: boolean };
+  type QuickProcessResult = { workspace: ReviewWorkspace | null; sampled: number; prepared: number; reused: number; cancelled: boolean };
   type VideoPreview = { path: string; isProxy: boolean };
   type VideoPreviewProgress = { sourceId: string; percent: number };
+  type AppliedAugmentation = { operation: string; applied: boolean; parameters: Record<string, string> };
+  type AugmentationPreview = {
+    id: string; recipeId: string; recipeName: string; inputAssetKey: string; variantIndex: number;
+    seed: string; lineageGroupId: string; executorName: string; executorVersion: string;
+    recipeSchemaVersion: number; appliedParameters: AppliedAugmentation[]; imagePath: string; contentSha256: string;
+  };
 
   const sections = [
     { id: "sources", label: "素材", icon: Images },
@@ -224,6 +233,8 @@
   let importProgress = $state<ImportProgress | null>(null);
   let samplingProgress = $state<OperationProgress | null>(null);
   let exportProgress = $state<OperationProgress | null>(null);
+  let quickProcessProgress = $state<OperationProgress | null>(null);
+  let reviewProgress = $state<OperationProgress | null>(null);
   let operationControlState = $state<OperationControlState>("running");
   let sourceRemovalCompletion = $state<{ deleted: number; candidateDeleted: number } | null>(null);
   let sourceRemovalCompletionTimer: number | undefined;
@@ -243,7 +254,7 @@
   let videoPreviewRequest = 0;
   const videoPreviewJobs = new Map<string, Promise<VideoPreview>>();
   const checkingSourceIds = new Set<string>();
-  let inspectorTab = $state<"info" | "sampling" | "roi" | "export">("info");
+  let inspectorTab = $state<"info" | "sampling" | "roi" | "augment" | "export">("info");
   let currentTimeMs = $state(0);
   let isPlaying = $state(false);
   let playbackRate = $state(1);
@@ -273,6 +284,8 @@
   let estimatePulseTimer: number | undefined;
   let roiProfiles = $state<RoiProfile[]>([]);
   let tilePreviews = $state<TilePreview[]>([]);
+  const tilePreviewCache = new Map<string, TilePreview[]>();
+  let tilePreviewRequest = 0;
   let selectedTilePreview = $state<TilePreview | null>(null);
   let checkedTileKeys = $state<Set<string>>(new Set());
   let excludedTiles = $state<Map<string, ExcludedTile>>(new Map());
@@ -302,14 +315,34 @@
   let conflictStrategy = $state<ConflictStrategy>("append_sequence");
   let exportPlan = $state<ExportPlan | null>(null);
   let exportBusy = $state("");
+  let augmentationBusy = $state("");
+  let augmentationPreviews = $state<AugmentationPreview[]>([]);
+  let selectedAugmentationPreview = $state<AugmentationPreview | null>(null);
+  let augmentationVariantCount = $state(4);
+  let augmentationBaseSeed = $state(2026);
+  let augmentationBrightnessEnabled = $state(true);
+  let augmentationBrightnessProbability = $state(80);
+  let augmentationBrightnessMin = $state(-18);
+  let augmentationBrightnessMax = $state(18);
+  let augmentationContrastEnabled = $state(true);
+  let augmentationContrastProbability = $state(65);
+  let augmentationContrastMin = $state(-12);
+  let augmentationContrastMax = $state(12);
+  let augmentationFlipEnabled = $state(true);
+  let augmentationFlipProbability = $state(50);
+  let augmentationRotateEnabled = $state(false);
+  let augmentationRotateProbability = $state(25);
   let reviewWorkspace = $state<ReviewWorkspace | null>(null);
+  let reviewScopeSourceIds = $state<string[]>([]);
   let reviewBusy = $state("");
   let checkedReviewKeys = $state<Set<string>>(new Set());
   let selectedReviewKey = $state("");
   let reviewStatusFilter = $state("all");
   let reviewSourceFilter = $state("all");
   let reviewGroupFilter = $state("all");
-  let reviewVisibleLimit = $state(400);
+  let reviewViewportWidth = $state(1_000);
+  let reviewViewportHeight = $state(700);
+  let reviewScrollTop = $state(0);
   let reviewMinWidth = $state(320);
   let reviewMinHeight = $state(240);
   let reviewMinSharpness = $state(80);
@@ -391,7 +424,10 @@
   const checkedTileCount = $derived(checkedTileKeys.size);
   const tilePreviewTotal = $derived(tilePreviews.length + excludedTiles.size);
   const selectedSourceGroupCount = $derived(selectedSource ? sources.filter((source) => source.kind === selectedSource.kind && source.sourceGroup === selectedSource.sourceGroup).length : 0);
+  const selectedExportSourceCount = $derived(selectedSource ? sources.filter((source) => source.kind === selectedSource.kind && checkedSourceIds.has(source.id)).length : 0);
+  const roiScopeSourceCount = $derived(roiScope === "source_group" ? selectedSourceGroupCount : selectedSource ? 1 : 0);
   const selectedReviewItem = $derived(reviewWorkspace?.items.find((item) => item.assetKey === selectedReviewKey) ?? null);
+  const augmentationInput = $derived(selectedReviewItem?.assetKind === "prepared" && selectedReviewItem.manualDecision !== "exclude" ? selectedReviewItem : null);
   const suggestedReviewKeys = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewEffectiveStatus(item) === "suggested").map((item) => item.assetKey));
   const reviewComparisonItems = $derived(
     reviewComparisonGroupId
@@ -409,7 +445,13 @@
       && (reviewSourceFilter === "all" || item.sourceIdentifier === reviewSourceFilter)
       && (reviewGroupFilter === "all" || item.similarityGroupId === reviewGroupFilter);
   }).sort((left, right) => reviewSortItems(left, right)));
-  const visibleReviewItems = $derived(filteredReviewItems.slice(0, reviewVisibleLimit));
+  const reviewWindow = $derived(calculateReviewWindow({
+    itemCount: filteredReviewItems.length,
+    viewportWidth: reviewViewportWidth,
+    viewportHeight: reviewViewportHeight,
+    scrollTop: reviewScrollTop,
+  }));
+  const visibleReviewItems = $derived(filteredReviewItems.slice(reviewWindow.start, reviewWindow.end));
   const reviewMetricValues = $derived((reviewWorkspace?.items ?? []).map((item) => reviewMetricValue(item, reviewQualityMetric)).filter((value): value is number => value !== null));
   const reviewMetricRange = $derived.by(() => {
     const values = reviewMetricValues;
@@ -440,9 +482,10 @@
   const reviewThresholdSamples = $derived((reviewWorkspace?.items ?? []).filter((item) => reviewMetricValue(item, reviewQualityMetric) !== null).slice().sort((left, right) => Math.abs((reviewMetricValue(left, reviewQualityMetric) ?? 0) - reviewMetricThreshold) - Math.abs((reviewMetricValue(right, reviewQualityMetric) ?? 0) - reviewMetricThreshold)).slice(0, 4));
   const shortcutHints = $derived.by(() => {
     if (activeSection === "review" && reviewComparisonGroupId) return [["Esc", "返回网格"], ["+ / -", "同步缩放"], ["0", "复位视图"], ["拖动", "同步平移"], ["Enter", "设为代表图"]];
+    if (activeSection === "review" && inspectorTab === "augment") return [["Ctrl+Enter", "生成增强预览"], ["Esc", "返回处理"]];
     if (activeSection === "review") return [["K", "保留"], ["X", "排除"], ["R", "恢复"], ["L", "锁定/解锁"], ["Esc", "返回处理"]];
     if (inspectorTab === "export") return [["Ctrl+S", "检查计划"], ["Enter", "确认导出"], ["Esc", "返回处理"]];
-    if (inspectorTab === "roi") return [["R", "新建 ROI"], ["拖动", "移动 ROI"], ["方向键", "微调"], ["Ctrl+S", "保存"], ["P", "保存并预览"]];
+    if (inspectorTab === "roi") return [["R", "新建 ROI"], ["拖动", "移动 ROI"], ["方向键", "微调"], ["Ctrl+S", "应用配置"], ["P", "应用并预览"]];
     if (isActiveVideo) return [["Space", "播放/暂停"], ["←/→", "逐帧"], ["A/D", "候选切换"], ["C", "保存帧"], ["I/O", "片段入/出点"]];
     return [["Ctrl+O", "打开项目"], ["Ctrl+I", "导入素材"], ["E", "导出"]];
   });
@@ -573,8 +616,70 @@
     checkedReviewKeys = next;
   }
 
+  function observeReviewGrid(node: HTMLElement) {
+    const updateSize = () => {
+      reviewViewportWidth = node.clientWidth;
+      reviewViewportHeight = node.clientHeight;
+    };
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(node);
+    updateSize();
+    return { destroy: () => observer.disconnect() };
+  }
+
+  function updateReviewScroll(event: Event) {
+    reviewScrollTop = (event.currentTarget as HTMLElement).scrollTop;
+  }
+
   function selectReviewItem(item: ReviewItem) {
     selectedReviewKey = item.assetKey;
+    if (augmentationPreviews.some((preview) => preview.inputAssetKey !== item.assetKey)) {
+      augmentationPreviews = [];
+      selectedAugmentationPreview = null;
+    }
+  }
+
+  function augmentationOperationLabel(operation: string) {
+    return ({ brightness: "亮度", contrast: "对比度", horizontal_flip: "水平翻转", rotate_90: "旋转 90°" } as Record<string, string>)[operation] ?? operation;
+  }
+
+  function augmentationParameterText(item: AppliedAugmentation) {
+    if (!item.applied) return "未触发";
+    const values = Object.entries(item.parameters).map(([key, value]) => `${key} ${value}`);
+    return values.length ? values.join(" · ") : "已执行";
+  }
+
+  async function previewAugmentations() {
+    if (!augmentationInput || augmentationBusy) return;
+    augmentationBusy = "正在生成固定种子增强预览";
+    try {
+      augmentationPreviews = await invoke<AugmentationPreview[]>("generate_augmentation_previews", {
+        request: {
+          inputAssetKey: augmentationInput.assetKey,
+          recipe: {
+            id: "m5-basic-recipe",
+            name: "基础训练增强",
+            schemaVersion: 1,
+            baseSeed: Math.max(0, Math.min(4_294_967_295, Math.round(augmentationBaseSeed))),
+            variantCount: Math.max(1, Math.min(16, Math.round(augmentationVariantCount))),
+            operations: [
+              { kind: "brightness", enabled: augmentationBrightnessEnabled, probability: augmentationBrightnessProbability / 100, minOffset: augmentationBrightnessMin, maxOffset: augmentationBrightnessMax },
+              { kind: "contrast", enabled: augmentationContrastEnabled, probability: augmentationContrastProbability / 100, minPercent: augmentationContrastMin, maxPercent: augmentationContrastMax },
+              { kind: "horizontal_flip", enabled: augmentationFlipEnabled, probability: augmentationFlipProbability / 100 },
+              { kind: "rotate90", enabled: augmentationRotateEnabled, probability: augmentationRotateProbability / 100, clockwise: true },
+            ],
+          },
+        },
+      });
+      selectedAugmentationPreview = augmentationPreviews[0] ?? null;
+      setMessage(`已生成 ${augmentationPreviews.length} 个可追溯增强预览`);
+    } catch (error) {
+      augmentationPreviews = [];
+      selectedAugmentationPreview = null;
+      setMessage(errorText(error), "error");
+    } finally {
+      augmentationBusy = "";
+    }
   }
 
   function openReviewComparison(item: ReviewItem) {
@@ -636,7 +741,7 @@
   async function loadReviewWorkspace(quiet = false) {
     if (!project) return;
     try {
-      reviewWorkspace = await invoke<ReviewWorkspace>("get_review_workspace");
+      reviewWorkspace = await invoke<ReviewWorkspace>("get_review_workspace", { sourceIds: reviewScopeSourceIds });
       if (reviewWorkspace.items.length && !reviewWorkspace.items.some((item) => item.assetKey === selectedReviewKey)) {
         selectedReviewKey = reviewWorkspace.items[0].assetKey;
       }
@@ -652,7 +757,10 @@
   async function runReviewAnalysis() {
     if (!project || reviewBusy) return;
     reviewBusy = "正在测量质量并生成相似组";
+    reviewProgress = null;
+    operationControlState = "running";
     activeSection = "review";
+    reviewScopeSourceIds = [];
     try {
       reviewWorkspace = await invoke<ReviewWorkspace>("run_review_analysis", {
         config: {
@@ -671,12 +779,61 @@
       checkedReviewKeys = new Set();
       closeReviewComparison();
       selectedReviewKey = reviewWorkspace.items[0]?.assetKey ?? "";
-      reviewVisibleLimit = 400;
+      reviewScrollTop = 0;
       setMessage(`分析完成：${reviewWorkspace.summary.total} 张审核资产，${reviewWorkspace.summary.similarityGroups} 个相似组，${reviewWorkspace.summary.suggestedExclude} 张建议排除`);
     } catch (error) {
       setMessage(errorText(error), "error");
     } finally {
       reviewBusy = "";
+      reviewProgress = null;
+    }
+  }
+
+  async function runQuickProcess() {
+    if (!project || reviewBusy) return;
+    reviewBusy = "正在启动快速处理";
+    quickProcessProgress = null;
+    operationControlState = "running";
+    try {
+      const sourceIds = checkedSourceIds.size
+        ? [...checkedSourceIds]
+        : selectedSourceId
+          ? [selectedSourceId]
+          : [];
+      reviewScopeSourceIds = sourceIds;
+      const result = await invoke<QuickProcessResult>("run_quick_process", {
+        sourceIds,
+        samplingConfig: currentSamplingConfig(),
+        reviewConfig: {
+          minWidth: reviewMinWidth,
+          minHeight: reviewMinHeight,
+          minSharpness: reviewMinSharpness,
+          maxUnderexposedRatio: reviewMaxUnderexposed / 100,
+          maxOverexposedRatio: reviewMaxOverexposed / 100,
+          maxLowInformation: reviewMaxLowInformation / 100,
+          phashDistance: reviewPhashDistance,
+          ssimThreshold: reviewSsimThreshold / 100,
+          similarityScope: reviewSimilarityScope,
+          videoTimeWindowMs: reviewTimeWindowSeconds * 1_000,
+        },
+      });
+      if (result.cancelled || !result.workspace) {
+        setMessage(`快速处理已取消；此前新增候选 ${result.sampled} 张，准备切片 ${result.prepared} 张`);
+        return;
+      }
+      reviewWorkspace = result.workspace;
+      checkedReviewKeys = new Set();
+      closeReviewComparison();
+      selectedReviewKey = reviewWorkspace.items[0]?.assetKey ?? "";
+      reviewScrollTop = 0;
+      activeSection = "review";
+      project = await invoke<ProjectSummary | null>("get_current_project");
+      setMessage(`快速处理完成：新增候选 ${result.sampled} 张，准备切片 ${result.prepared} 张，复用 ${result.reused} 张；已停在审核阶段`);
+    } catch (error) {
+      setMessage(errorText(error), "error");
+    } finally {
+      reviewBusy = "";
+      quickProcessProgress = null;
     }
   }
 
@@ -685,7 +842,7 @@
     if (!keys.length || reviewBusy) return;
     reviewBusy = "正在保存审核决定";
     try {
-      reviewWorkspace = await invoke<ReviewWorkspace>("update_review_items", { assetKeys: keys, action });
+      reviewWorkspace = await invoke<ReviewWorkspace>("update_review_items", { assetKeys: keys, action, sourceIds: reviewScopeSourceIds });
       if (action !== "lock" && action !== "unlock") checkedReviewKeys = new Set();
       setMessage(`已更新 ${keys.length} 个审核项`);
     } catch (error) {
@@ -699,7 +856,7 @@
     if (!reviewWorkspace?.canUndo || reviewBusy) return;
     reviewBusy = "正在撤销审核操作";
     try {
-      reviewWorkspace = await invoke<ReviewWorkspace>("undo_review_action");
+      reviewWorkspace = await invoke<ReviewWorkspace>("undo_review_action", { sourceIds: reviewScopeSourceIds });
       checkedReviewKeys = new Set();
       setMessage("已撤销最近一次审核操作");
     } catch (error) {
@@ -713,7 +870,7 @@
     if (!reviewWorkspace?.canRedo || reviewBusy) return;
     reviewBusy = "正在重做审核操作";
     try {
-      reviewWorkspace = await invoke<ReviewWorkspace>("redo_review_action");
+      reviewWorkspace = await invoke<ReviewWorkspace>("redo_review_action", { sourceIds: reviewScopeSourceIds });
       checkedReviewKeys = new Set();
       setMessage("已重做审核操作");
     } catch (error) {
@@ -732,6 +889,7 @@
     if (checked) next.add(sourceId);
     else next.delete(sourceId);
     checkedSourceIds = next;
+    if (exportSourceScope === "selected") exportPlan = null;
   }
 
   function sourceGroupItems(group: string) {
@@ -751,6 +909,7 @@
       else next.delete(source.id);
     }
     checkedSourceIds = next;
+    if (exportSourceScope === "selected") exportPlan = null;
     setMessage(checked ? `已选中来源组“${group}”的 ${items.length} 个来源` : `已取消来源组“${group}”`);
   }
 
@@ -888,6 +1047,21 @@
 
   function tilePreviewKey(preview: TilePreview) {
     return [preview.sourceId, preview.candidateId ?? "source", preview.roiProfileId, preview.placement.row, preview.placement.column].join(":");
+  }
+
+  function tilePreviewCacheKey(sourceId: string, candidateId: string | null = null) {
+    return `${sourceId}:${candidateId ?? "source"}`;
+  }
+
+  function invalidateTilePreviewCache(profile: RoiProfile) {
+    const affected = profile.scope === "source_group"
+      ? sources.filter((source) => source.sourceGroup === profile.scopeValue).map((source) => source.id)
+      : [profile.scopeValue];
+    for (const sourceId of affected) {
+      for (const key of [...tilePreviewCache.keys()]) {
+        if (key.startsWith(`${sourceId}:`)) tilePreviewCache.delete(key);
+      }
+    }
   }
 
   function toggleTileChecked(preview: TilePreview, checked: boolean) {
@@ -1116,23 +1290,30 @@
     resizeMode = profile.renderConfig.resize;
   }
 
-  async function loadRoiWorkspace(sourceId: string) {
+  async function loadRoiWorkspace(sourceId: string, restorePreview = false) {
     try {
       roiProfiles = await invoke<RoiProfile[]>("get_roi_profiles", { sourceId });
-      tilePreviews = [];
+      const source = sources.find((item) => item.id === sourceId);
+      const candidateId = source?.kind === "video" ? selectedCandidateId || null : null;
+      const validProfileIds = new Set(roiProfiles.map((profile) => profile.id));
+      tilePreviews = (tilePreviewCache.get(tilePreviewCacheKey(sourceId, candidateId)) ?? [])
+        .filter((preview) => validProfileIds.has(preview.roiProfileId));
       selectedTilePreview = null;
       checkedTileKeys = new Set();
       excludedTiles = new Map();
       exportPlan = null;
       if (roiProfiles.length) editRoi(roiProfiles[0]);
       else beginNewRoi();
+      if (restorePreview && roiProfiles.length && tilePreviews.length === 0) {
+        await previewRoiTiles({ quiet: true, sourceId });
+      }
     } catch (error) {
       roiProfiles = [];
       setMessage(errorText(error), "error");
     }
   }
 
-  async function saveRoi(options: { auto?: boolean; previewAfter?: boolean } = {}) {
+  async function saveRoi(options: { auto?: boolean; previewAfter?: boolean; preservePreview?: boolean } = {}) {
     if (!selectedSource) return null;
     roiBusy = "正在保存 ROI";
     try {
@@ -1154,12 +1335,18 @@
           },
         },
       });
+      const regeneratePreview = options.previewAfter
+        || (options.preservePreview !== false && tilePreviews.length > 0);
+      invalidateTilePreviewCache(saved);
       await loadRoiWorkspace(selectedSource.id);
       selectedRoiId = saved.id;
       const effective = roiProfiles.find((profile) => profile.id === saved.id);
       if (effective) editRoi(effective);
-      setMessage((options.auto ? "已自动保存 ROI“" : "已保存 ROI“") + saved.name + "”");
-      if (options.previewAfter) await previewRoiTiles();
+      if (regeneratePreview) await previewRoiTiles({ quiet: true });
+      const scopeMessage = saved.scope === "source_group"
+        ? `已应用到来源组“${selectedSource.sourceGroup}”的 ${selectedSourceGroupCount} 个素材`
+        : `已应用到当前素材`;
+      setMessage(`${options.auto ? "已自动应用" : "已应用"} ROI“${saved.name}”；${scopeMessage}`);
       return saved;
     } catch (error) {
       setMessage(errorText(error), "error");
@@ -1173,7 +1360,9 @@
     if (!selectedSource || !selectedRoiId) return;
     roiBusy = "正在删除 ROI";
     try {
+      const deleting = roiProfiles.find((profile) => profile.id === selectedRoiId);
       await invoke<boolean>("delete_roi_profile", { profileId: selectedRoiId });
+      if (deleting) invalidateTilePreviewCache(deleting);
       await loadRoiWorkspace(selectedSource.id);
       setMessage("ROI 已删除");
     } catch (error) {
@@ -1191,24 +1380,31 @@
     roiAutoSaveTimer = window.setTimeout(() => void saveRoi({ auto: true }), 350);
   }
 
-  async function previewRoiTiles() {
+  async function previewRoiTiles(options: { quiet?: boolean; sourceId?: string } = {}) {
     if (!selectedSource) return;
+    const requestedSourceId = options.sourceId ?? selectedSource.id;
+    if (requestedSourceId !== selectedSource.id) return;
+    const requestId = ++tilePreviewRequest;
     roiBusy = "正在生成切片预览";
     try {
-      tilePreviews = await invoke<TilePreview[]>("preview_tiles", {
-        sourceId: selectedSource.id,
+      const candidateId = selectedSource.kind === "video" ? selectedCandidateId || null : null;
+      const previews = await invoke<TilePreview[]>("preview_tiles", {
+        sourceId: requestedSourceId,
         candidateId: selectedSource.kind === "video" ? selectedCandidateId || null : null,
         limit: 1_000,
       });
+      tilePreviewCache.set(tilePreviewCacheKey(requestedSourceId, candidateId), previews);
+      if (requestId !== tilePreviewRequest || selectedSourceId !== requestedSourceId) return;
+      tilePreviews = previews;
       checkedTileKeys = new Set();
       excludedTiles = new Map();
       selectedTilePreview = tilePreviews[0] ?? null;
       inspectorTab = "roi";
-      setMessage("已生成 " + tilePreviews.length + " 个切片预览");
+      if (!options.quiet) setMessage("已生成 " + tilePreviews.length + " 个切片预览");
     } catch (error) {
-      setMessage(errorText(error), "error");
+      if (requestId === tilePreviewRequest) setMessage(errorText(error), "error");
     } finally {
-      roiBusy = "";
+      if (requestId === tilePreviewRequest) roiBusy = "";
     }
   }
 
@@ -1221,6 +1417,7 @@
     return {
       sourceId: selectedSource?.id ?? "",
       sourceScope: exportSourceScope,
+      selectedSourceIds: exportSourceScope === "selected" ? [...checkedSourceIds] : [],
       candidateId: selectedSource?.kind === "video" && exportSourceScope === "current" && exportCandidateScope === "selected" ? selectedCandidateId || null : null,
       outputDir: exportDirectory,
       namingTemplate,
@@ -1234,8 +1431,18 @@
 
   function setExportSourceScope(scope: ExportSourceScope) {
     exportSourceScope = scope;
-    if (scope === "source_group") exportCandidateScope = "all";
+    if (scope !== "current") exportCandidateScope = "all";
     exportPlan = null;
+  }
+
+  async function applyRoiAndOpenBatchExport() {
+    const saved = await saveRoi({ preservePreview: false });
+    if (!saved || !selectedSource) return;
+    setExportContent("tiles");
+    if (selectedExportSourceCount > 1) setExportSourceScope("selected");
+    else setExportSourceScope(saved.scope === "source_group" ? "source_group" : "current");
+    setExportReviewScope("eligible");
+    activateSection("export");
   }
 
   function setExportContent(content: ExportContent) {
@@ -1293,6 +1500,10 @@
 
   async function previewExportPlan() {
     if (!selectedSource || !exportDirectory) return;
+    if (exportSourceScope === "selected" && selectedExportSourceCount === 0) {
+      setMessage("请先在左侧勾选要批量导出的同类型素材", "error");
+      return;
+    }
     if (selectedSource.kind === "video" && exportSourceScope === "current" && exportCandidateScope === "selected" && !selectedCandidateId) {
       setMessage("请先在底部候选栏选择要导出的帧", "error");
       return;
@@ -1614,6 +1825,9 @@
       project = await invoke<ProjectSummary | null>("get_current_project");
       checkedCandidateIds = new Set();
       if (!candidates.some((candidate) => candidate.id === selectedCandidateId)) selectedCandidateId = "";
+      for (const key of [...tilePreviewCache.keys()]) {
+        if (key.startsWith(`${selectedSource.id}:`)) tilePreviewCache.delete(key);
+      }
       tilePreviews = [];
       selectedTilePreview = null;
       exportPlan = null;
@@ -1660,10 +1874,11 @@
     selectedTilePreview = null;
   }
 
-  function activateInspectorTab(tab: "info" | "sampling" | "roi" | "export") {
+  function activateInspectorTab(tab: "info" | "sampling" | "roi" | "augment" | "export") {
     inspectorTab = tab;
     if (tab === "info") activeSection = "sources";
     else if (tab === "export") activeSection = "export";
+    else if (tab === "augment") activeSection = "review";
     else activeSection = "process";
     if (tab === "info" || tab === "sampling") selectedTilePreview = null;
   }
@@ -1726,7 +1941,7 @@
       await loadVideoWorkspace(sourceId);
     }
     else resetVideoWorkspace();
-    await loadRoiWorkspace(sourceId);
+    await loadRoiWorkspace(sourceId, inspectorTab === "roi" && source?.status === "online");
   }
 
   async function selectSourceGroup(items: SourceAsset[]) {
@@ -1915,6 +2130,11 @@
         else if (inspectorTab === "roi" && selectedSource) void saveRoi();
         return;
       }
+      if (activeSection === "review" && inspectorTab === "augment" && commandKey && event.key === "Enter") {
+        event.preventDefault();
+        void previewAugmentations();
+        return;
+      }
       if (activeSection === "review" && event.key === "Escape") {
         event.preventDefault();
         if (reviewComparisonGroupId) closeReviewComparison();
@@ -2030,6 +2250,8 @@
     let unlistenVideoPreviewProgress: (() => void) | undefined;
     let unlistenSamplingProgress: (() => void) | undefined;
     let unlistenExportProgress: (() => void) | undefined;
+    let unlistenQuickProcessProgress: (() => void) | undefined;
+    let unlistenReviewProgress: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
       void listen<SourceDeletionProgress>("source-removal-progress", (event) => {
         sourceRemovalProgress = event.payload;
@@ -2050,6 +2272,14 @@
       void listen<OperationProgress>("export-progress", (event) => {
         exportProgress = event.payload;
       }).then((stop) => (unlistenExportProgress = stop));
+      void listen<OperationProgress>("quick-process-progress", (event) => {
+        quickProcessProgress = event.payload;
+        reviewBusy = event.payload.phase;
+      }).then((stop) => (unlistenQuickProcessProgress = stop));
+      void listen<OperationProgress>("review-progress", (event) => {
+        reviewProgress = event.payload;
+        reviewBusy = event.payload.phase;
+      }).then((stop) => (unlistenReviewProgress = stop));
       void getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") dragActive = true;
         if (event.payload.type === "leave") dragActive = false;
@@ -2078,6 +2308,8 @@
       unlistenVideoPreviewProgress?.();
       unlistenSamplingProgress?.();
       unlistenExportProgress?.();
+      unlistenQuickProcessProgress?.();
+      unlistenReviewProgress?.();
       window.clearInterval(statusTimer);
       window.removeEventListener("focus", verifySelected);
       sourcePanel.removeEventListener("contextmenu", showSourceContextMenu);
@@ -2123,7 +2355,7 @@
         {/if}
       </div>
       <button class="command" disabled={!isActiveVideo || !!videoBusy} onclick={estimateVideoSampling} title="估算当前视频抽帧数量"><CircleGauge size={16} /><span>预估</span></button>
-      <button class="command primary" disabled={!project || !!reviewBusy || !!busyMessage} onclick={runReviewAnalysis} title="对现有原图和视频候选运行质量与相似审核"><ListChecks size={16} /><span>质量审核</span></button>
+      <button class="command primary" disabled={!project || !!reviewBusy || !!busyMessage} onclick={runQuickProcess} title="必要时抽帧，准备 ROI 切片并运行质量与相似分析；完成后停在审核阶段"><Activity size={16} /><span>快速处理</span></button>
       <button class="command" disabled={!selectedSource} onclick={() => activateSection("export")}><Download size={16} /><span>导出</span></button>
       <button class="icon-button" onclick={toggleTheme} title="切换主题" aria-label="切换主题">{#if theme === "light"}<Moon size={17} />{:else}<Sun size={17} />{/if}</button>
       <button class="icon-button" disabled title="应用设置将在后续里程碑接入" aria-label="设置"><Settings2 size={17} /></button>
@@ -2194,7 +2426,7 @@
     {#if activeSection === "review"}
       <div class="review-toolbar">
         <div class="review-title"><ListChecks size={17} /><div><strong>审核工作台</strong><span>{reviewWorkspace ? `${filteredReviewItems.length} / ${reviewWorkspace.summary.total} 张` : "尚未运行分析"}</span></div></div>
-        <label class="review-select-all"><input type="checkbox" checked={visibleReviewItems.length > 0 && visibleReviewItems.every((item) => checkedReviewKeys.has(item.assetKey))} onchange={(event) => toggleAllVisibleReview(event.currentTarget.checked)} /><span>选择当前页</span></label>
+        <label class="review-select-all"><input type="checkbox" checked={visibleReviewItems.length > 0 && visibleReviewItems.every((item) => checkedReviewKeys.has(item.assetKey))} onchange={(event) => toggleAllVisibleReview(event.currentTarget.checked)} /><span>选择可见</span></label>
         <select bind:value={reviewStatusFilter} aria-label="审核状态筛选">
           <option value="all">全部状态</option><option value="suggested">建议排除</option><option value="excluded">人工排除</option><option value="warning">质量警告</option><option value="keep">保留</option><option value="error">失败</option>
         </select>
@@ -2219,8 +2451,17 @@
         <span><strong>{reviewWorkspace?.summary.locked ?? 0}</strong> 锁定</span>
         <span><strong>{reviewWorkspace?.summary.similarityGroups ?? 0}</strong> 相似组</span>
       </div>
-      <div class="review-grid-shell">
-        {#if reviewBusy}
+      <div class="review-grid-shell" use:observeReviewGrid onscroll={updateReviewScroll}>
+        {#if inspectorTab === "augment"}
+          <div class="augmentation-stage">
+            {#if augmentationInput}
+              <article><header><span>稳定切片输入</span><strong>{augmentationInput.displayName}</strong></header><div><img src={convertFileSrc(augmentationInput.imagePath)} alt="增强输入" /></div><footer class="mono">{augmentationInput.assetKey}</footer></article>
+              <article class:empty={!selectedAugmentationPreview}><header><span>固定种子变体</span><strong>{selectedAugmentationPreview ? `变体 ${selectedAugmentationPreview.variantIndex + 1}` : "等待生成"}</strong></header><div>{#if selectedAugmentationPreview}<img src={convertFileSrc(selectedAugmentationPreview.imagePath)} alt={`增强变体 ${selectedAugmentationPreview.variantIndex + 1}`} />{:else}<WandSparkles size={34} /><p>在右侧配置配方并生成预览</p>{/if}</div><footer class="mono">{selectedAugmentationPreview ? `seed ${selectedAugmentationPreview.seed} · ${selectedAugmentationPreview.contentSha256.slice(0, 16)}…` : "预览不会修改源素材"}</footer></article>
+            {:else}
+              <div class="review-empty"><WandSparkles size={30} /><strong>先选择稳定切片</strong><span>切片准备并运行审核后，在网格选择一张未排除的 ROI 切片。</span><button onclick={() => (inspectorTab = "info")}><ArrowLeft size={14} />返回质量审核</button></div>
+            {/if}
+          </div>
+        {:else if reviewBusy}
           <div class="review-empty"><LoaderCircle size={28} class="spinning" /><strong>{reviewBusy}</strong><span>自动建议不会覆盖已有人工决定。</span></div>
         {:else if !reviewWorkspace}
           <div class="review-empty"><ScanLine size={30} /><strong>尚未生成审核结果</strong><span>运行质量与相似分析后在这里确认建议排除项。</span><button class="primary" onclick={runReviewAnalysis}><Play size={14} fill="currentColor" />开始分析</button></div>
@@ -2288,7 +2529,8 @@
         {:else if filteredReviewItems.length === 0}
           <div class="review-empty"><Search size={28} /><strong>当前筛选没有结果</strong><span>调整状态、来源或相似组筛选。</span></div>
         {:else}
-          <div class="review-grid">
+          <div class="review-virtual-space" style:height={`${reviewWindow.totalHeight}px`}>
+          <div class="review-grid virtual" style:transform={`translateY(${reviewWindow.offsetTop}px)`}>
             {#each visibleReviewItems as item}
               {@const status = reviewEffectiveStatus(item)}
               <div class="review-card" class:selected={selectedReviewKey === item.assetKey} class:suggested={status === "suggested"} class:excluded={status === "excluded"} class:warning={status === "warning"} class:error={status === "error"} class:representative={item.representative}>
@@ -2307,7 +2549,7 @@
               </div>
             {/each}
           </div>
-          {#if visibleReviewItems.length < filteredReviewItems.length}<button class="review-load-more" onclick={() => (reviewVisibleLimit += 400)}>加载更多 {filteredReviewItems.length - visibleReviewItems.length}</button>{/if}
+          </div>
         {/if}
       </div>
     {:else}
@@ -2483,9 +2725,63 @@
   <aside class="inspector">
     {#if activeSection === "review"}
       <section class="sampling-heading review-heading">
-        <div><span class="eyebrow">质量与相似审核</span><h2>{reviewWorkspace ? `${reviewWorkspace.summary.total} 张审核资产` : "等待分析"}</h2></div>
-        <ListChecks size={17} />
+        <div><span class="eyebrow">{inspectorTab === "augment" ? "M5 固定种子预览" : "质量与相似审核"}</span><h2>{inspectorTab === "augment" ? (augmentationInput?.displayName ?? "选择合格切片") : (reviewWorkspace ? `${reviewWorkspace.summary.total} 张审核资产` : "等待分析")}</h2></div>
+        {#if inspectorTab === "augment"}<WandSparkles size={17} />{:else}<ListChecks size={17} />{/if}
       </section>
+      <div class="review-mode-switch" role="tablist" aria-label="审核与增强工作区">
+        <button class:active={inspectorTab !== "augment"} onclick={() => (inspectorTab = "info")}><ListChecks size={13} />质量审核</button>
+        <button class:active={inspectorTab === "augment"} onclick={() => (inspectorTab = "augment")}><WandSparkles size={13} />增强预览</button>
+      </div>
+      {#if inspectorTab === "augment"}
+        {#if augmentationBusy}<div class="video-busy"><LoaderCircle size={14} class="spinning" /><span>{augmentationBusy}</span></div>{/if}
+        <div class="sampling-panel augmentation-panel">
+          <div class="augmentation-source">
+            {#if augmentationInput}
+              <img src={convertFileSrc(augmentationInput.thumbnailPath)} alt="" />
+              <div><strong>{augmentationInput.displayName}</strong><span class="mono">{augmentationInput.assetKey.slice(0, 28)}…</span></div>
+            {:else}
+              <AlertCircle size={16} /><span>请在审核网格中选择一张未排除的 ROI 切片。M5 增强以稳定切片资产键为输入。</span>
+            {/if}
+          </div>
+          <div class="augmentation-seed-grid">
+            <label><span>每图变体</span><input type="number" min="1" max="16" bind:value={augmentationVariantCount} /></label>
+            <label><span>基础种子</span><input type="number" min="0" max="4294967295" step="1" bind:value={augmentationBaseSeed} /></label>
+          </div>
+          <div class="subsection-heading"><span>执行顺序</span><small>从上到下</small></div>
+          <div class="augmentation-operations">
+            <section>
+              <label class="toggle-row"><input type="checkbox" bind:checked={augmentationBrightnessEnabled} /><span>01 亮度</span></label>
+              <div class="augmentation-range"><label><span>概率 %</span><input type="number" min="0" max="100" bind:value={augmentationBrightnessProbability} /></label><label><span>最小偏移</span><input type="number" min="-255" max="255" bind:value={augmentationBrightnessMin} /></label><label><span>最大偏移</span><input type="number" min="-255" max="255" bind:value={augmentationBrightnessMax} /></label></div>
+            </section>
+            <section>
+              <label class="toggle-row"><input type="checkbox" bind:checked={augmentationContrastEnabled} /><span>02 对比度</span></label>
+              <div class="augmentation-range"><label><span>概率 %</span><input type="number" min="0" max="100" bind:value={augmentationContrastProbability} /></label><label><span>最小 %</span><input type="number" min="-100" max="100" bind:value={augmentationContrastMin} /></label><label><span>最大 %</span><input type="number" min="-100" max="100" bind:value={augmentationContrastMax} /></label></div>
+            </section>
+            <section class="augmentation-binary"><label class="toggle-row"><input type="checkbox" bind:checked={augmentationFlipEnabled} /><span>03 水平翻转</span></label><label><span>概率 %</span><input type="number" min="0" max="100" bind:value={augmentationFlipProbability} /></label></section>
+            <section class="augmentation-binary risk"><label class="toggle-row"><input type="checkbox" bind:checked={augmentationRotateEnabled} /><span>04 顺时针旋转 90°</span></label><label><span>概率 %</span><input type="number" min="0" max="100" bind:value={augmentationRotateProbability} /></label><small>旋转可能改变目标方向语义，请按训练任务确认。</small></section>
+          </div>
+          <div class="augmentation-notice"><WandSparkles size={14} /><span>预览写入项目缓存并记录实际参数，不会修改源素材，也不会进入当前正式导出。</span></div>
+          <button class="analysis-command primary" onclick={previewAugmentations} disabled={!augmentationInput || !!augmentationBusy}><WandSparkles size={14} />生成固定种子预览</button>
+          {#if augmentationPreviews.length}
+            <div class="subsection-heading"><span>变体预览</span><strong>{augmentationPreviews.length}</strong></div>
+            <div class="augmentation-preview-list">
+              {#each augmentationPreviews as preview}
+                <button class:selected={selectedAugmentationPreview?.id === preview.id} onclick={() => (selectedAugmentationPreview = preview)}>
+                  <img src={convertFileSrc(preview.imagePath)} alt={`变体 ${preview.variantIndex + 1}`} />
+                  <div><strong>变体 {preview.variantIndex + 1}</strong><span class="mono">seed {preview.seed}</span></div>
+                </button>
+              {/each}
+            </div>
+            {#if selectedAugmentationPreview}
+              <div class="augmentation-provenance">
+                <div><span>执行器</span><strong>{selectedAugmentationPreview.executorName} / {selectedAugmentationPreview.executorVersion}</strong></div>
+                <div><span>血缘组</span><strong class="mono">{selectedAugmentationPreview.lineageGroupId.slice(0, 20)}…</strong></div>
+                {#each selectedAugmentationPreview.appliedParameters as item}<div><span>{augmentationOperationLabel(item.operation)}</span><strong class:muted={!item.applied}>{augmentationParameterText(item)}</strong></div>{/each}
+              </div>
+            {/if}
+          {/if}
+        </div>
+      {:else}
       {#if reviewBusy}<div class="video-busy"><LoaderCircle size={14} class="spinning" /><span>{reviewBusy}</span></div>{/if}
       <div class="sampling-panel review-settings">
         <div class="subsection-heading"><span>质量阈值</span><Activity size={14} /></div>
@@ -2548,6 +2844,7 @@
           </div>
         {:else}<span class="range-empty">从审核网格选择一个项目查看测量值</span>{/if}
       </div>
+      {/if}
     {:else}
     <div class="inspector-tabs">
       <button class:active={inspectorTab === "info"} onclick={() => activateInspectorTab("info")}>素材信息</button>
@@ -2569,6 +2866,7 @@
         <div class="field-row export-mode-row"><span>导出范围</span><div class="segmented-control" aria-label="导出范围">
           <button class:active={exportSourceScope === "current"} onclick={() => setExportSourceScope("current")}><ImageIcon size={13} />当前素材</button>
           <button class:active={exportSourceScope === "source_group"} onclick={() => setExportSourceScope("source_group")}><FolderTree size={13} />来源组 {selectedSourceGroupCount}</button>
+          <button class:active={exportSourceScope === "selected"} disabled={!selectedExportSourceCount} onclick={() => setExportSourceScope("selected")}><SquareCheckBig size={13} />已选 {selectedExportSourceCount}</button>
         </div></div>
         {#if selectedSource.kind === "video" && exportSourceScope === "current"}
           <div class="field-row export-mode-row"><span>候选范围</span><div class="segmented-control" aria-label="候选范围">
@@ -2605,7 +2903,7 @@
           </div>
         {/if}
       </div>
-      <div class="sampling-actions"><button onclick={previewExportPlan} disabled={!exportDirectory || !!exportBusy}><CircleGauge size={14} />检查计划</button><button class="primary" onclick={executeExport} disabled={!exportPlan || !!exportBusy}><Download size={14} />确认并导出</button></div>
+      <div class="sampling-actions"><button onclick={previewExportPlan} disabled={!exportDirectory || !!exportBusy || (exportSourceScope === "selected" && selectedExportSourceCount === 0)}><CircleGauge size={14} />检查计划</button><button class="primary" onclick={executeExport} disabled={!exportPlan || !!exportBusy || (exportSourceScope === "selected" && selectedExportSourceCount === 0)}><Download size={14} />确认并导出</button></div>
     {:else if inspectorTab === "sampling" && selectedSource?.kind === "video"}
       <section class="sampling-heading">
         <div><span class="eyebrow">视频人工筛查</span><h2>{selectedSource.fileName}</h2></div>
@@ -2713,6 +3011,10 @@
         <label class="field-row"><span>应用范围</span><select bind:value={roiScope}>
           <option value="source_group">来源组 {selectedSource.sourceGroup}</option><option value="source">仅此来源</option>
         </select></label>
+        <div class="roi-scope-summary">
+          <FolderTree size={14} />
+          <span>{roiScope === "source_group" ? `这套 ROI 与切片参数将应用到来源组中的 ${roiScopeSourceCount} 个素材。` : "这套 ROI 与切片参数只覆盖当前素材。"}</span>
+        </div>
         <div class="subsection-heading"><span>逻辑画面坐标</span><Crop size={14} /></div>
         <div class="analysis-grid coordinate-grid">
           <label><span>X</span><input type="number" min="0" bind:value={roiX} /></label>
@@ -2740,8 +3042,8 @@
       </div>
       <div class="roi-actions">
         <button onclick={removeRoi} disabled={!selectedRoiId || !!roiBusy} title="删除 ROI"><Trash2 size={14} /></button>
-        <button onclick={() => saveRoi()} disabled={!roiName.trim() || !!roiBusy}><Save size={14} />保存</button>
-        <button class="primary" onclick={() => saveRoi({ previewAfter: true })} disabled={!roiName.trim() || !!roiBusy}><LayoutGrid size={14} />保存并预览</button>
+        <button onclick={() => saveRoi({ previewAfter: true })} disabled={!roiName.trim() || !!roiBusy}><LayoutGrid size={14} />应用并预览</button>
+        <button class="primary" onclick={applyRoiAndOpenBatchExport} disabled={!roiName.trim() || !!roiBusy}><Download size={14} />进入批量导出</button>
       </div>
     {:else if selectedSource}
       <section class="asset-heading">
@@ -2795,6 +3097,20 @@
       <p>正在建立项目引用和预览缩略图；原始文件保持不变。</p>
       <div class="source-progress-track" class:indeterminate={!importProgress.total}><span style:width={`${importProgress.total ? importProgress.completed / importProgress.total * 100 : 28}%`}></span></div>
       <footer><span>{importProgress.total ? `${importProgress.completed} / ${importProgress.total}` : `已发现 ${importProgress.completed}`}</span><span>新增 {importProgress.imported} · 更新 {importProgress.updated} · 忽略 {importProgress.unsupported} · 失败 {importProgress.failed}</span></footer>
+    </section>
+  {:else if quickProcessProgress}
+    <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class={operationControlState === "running" ? "spinning" : ""} /><strong>{operationControlState === "paused" ? "快速处理已暂停" : operationControlState === "cancelling" ? "正在取消快速处理" : quickProcessProgress.phase}</strong><div class="progress-actions"><button disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("quick_process", operationControlState === "paused" ? "resume" : "pause")} title={operationControlState === "paused" ? "继续快速处理" : "暂停快速处理"} aria-label={operationControlState === "paused" ? "继续快速处理" : "暂停快速处理"}>{#if operationControlState === "paused"}<Play size={14} />{:else}<Pause size={14} />{/if}</button><button class="cancel" disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("quick_process", "cancel")} title="取消快速处理" aria-label="取消快速处理"><X size={15} /></button></div></header>
+      <p>按抽帧、稳定切片、质量与相似分析顺序执行；不会自动导出。</p>
+      <div class="source-progress-track" class:indeterminate={!quickProcessProgress.total}><span style:width={`${quickProcessProgress.total ? quickProcessProgress.completed / quickProcessProgress.total * 100 : 28}%`}></span></div>
+      <footer><span>{quickProcessProgress.total ? `${quickProcessProgress.completed} / ${quickProcessProgress.total}` : "准备中"}</span><span>完成 {quickProcessProgress.succeeded} · 复用 {quickProcessProgress.existing} · 失败 {quickProcessProgress.failed}</span></footer>
+    </section>
+  {:else if reviewProgress}
+    <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">
+      <header><LoaderCircle size={17} class={operationControlState === "running" ? "spinning" : ""} /><strong>{operationControlState === "paused" ? "审核分析已暂停" : operationControlState === "cancelling" ? "正在取消审核分析" : reviewProgress.phase}</strong><div class="progress-actions"><button disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("review", operationControlState === "paused" ? "resume" : "pause")} title={operationControlState === "paused" ? "继续审核分析" : "暂停审核分析"} aria-label={operationControlState === "paused" ? "继续审核分析" : "暂停审核分析"}>{#if operationControlState === "paused"}<Play size={14} />{:else}<Pause size={14} />{/if}</button><button class="cancel" disabled={operationControlState === "cancelling"} onclick={() => controlLongOperation("review", "cancel")} title="取消审核分析" aria-label="取消审核分析"><X size={15} /></button></div></header>
+      <p>正在测量质量并生成相似组；不会修改或删除源素材。</p>
+      <div class="source-progress-track"><span style:width={`${reviewProgress.total ? reviewProgress.completed / reviewProgress.total * 100 : 0}%`}></span></div>
+      <footer><span>{reviewProgress.completed} / {reviewProgress.total}</span><span>已分析 {reviewProgress.succeeded}</span></footer>
     </section>
   {:else if samplingProgress}
     <section class="source-removal-progress" class:paused={operationControlState === "paused"} role="status" aria-live="polite">

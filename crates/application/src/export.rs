@@ -13,7 +13,12 @@ pub fn plan_export(
     let selected_source = store
         .get_source(&request.source_id)?
         .ok_or_else(|| ApplicationError::SourceNotFound(request.source_id.clone()))?;
-    let sources = resolve_export_sources(&store, &selected_source, request.source_scope)?;
+    let sources = resolve_export_sources(
+        &store,
+        &selected_source,
+        request.source_scope,
+        &request.selected_source_ids,
+    )?;
     let manually_excluded = if request.review_scope == ExportReviewScope::Eligible {
         store
             .list_review_assets()?
@@ -24,6 +29,22 @@ pub fn plan_export(
     } else {
         HashSet::new()
     };
+    let prepared_keys = store
+        .list_prepared_images()?
+        .into_iter()
+        .map(|image| {
+            (
+                (
+                    image.source_id,
+                    image.candidate_id,
+                    image.roi_profile_id,
+                    image.tile_row,
+                    image.tile_column,
+                ),
+                image.asset_key,
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut occupied = existing_file_names(&output_dir)?;
     let mut items = Vec::new();
     let mut skipped = 0_u64;
@@ -50,25 +71,11 @@ pub fn plan_export(
                 .as_ref()
                 .map(|candidate_id| format!("candidate:{candidate_id}"))
                 .unwrap_or_else(|| format!("source:{}", source.id));
-            if manually_excluded.contains(&review_key) {
-                skipped += if request.content == ExportContent::Frames {
-                    1
-                } else {
-                    profiles.iter().try_fold(0_u64, |count, profile| {
-                        profile.roi.validate(input.width, input.height)?;
-                        Ok::<_, ApplicationError>(
-                            count
-                                + image_pipeline::plan_tiles(
-                                    profile.roi,
-                                    profile.render_config.tile,
-                                )?
-                                .len() as u64,
-                        )
-                    })?
-                };
-                continue;
-            }
             if request.content == ExportContent::Frames {
+                if manually_excluded.contains(&review_key) {
+                    skipped += 1;
+                    continue;
+                }
                 let placement = full_frame_placement(input.width, input.height);
                 let stem = template.render(&NamingContext {
                     source: &source,
@@ -105,6 +112,21 @@ pub fn plan_export(
                 for placement in
                     image_pipeline::plan_tiles(profile.roi, profile.render_config.tile)?
                 {
+                    let prepared_key = prepared_keys.get(&(
+                        source.id.clone(),
+                        input.candidate_id.clone(),
+                        profile.id.clone(),
+                        placement.row,
+                        placement.column,
+                    ));
+                    if prepared_key
+                        .map(|key| manually_excluded.contains(key))
+                        .unwrap_or_else(|| manually_excluded.contains(&review_key))
+                    {
+                        skipped += 1;
+                        index += 1;
+                        continue;
+                    }
                     if request.excluded_tiles.iter().any(|excluded| {
                         excluded.source_id == source.id
                             && excluded.candidate_id == input.candidate_id
@@ -347,16 +369,24 @@ fn resolve_export_sources(
     store: &ProjectStore,
     selected_source: &StoredSourceAsset,
     scope: ExportSourceScope,
+    selected_source_ids: &[String],
 ) -> Result<Vec<StoredSourceAsset>, ApplicationError> {
     if scope == ExportSourceScope::Current {
         return Ok(vec![selected_source.clone()]);
     }
+    let selected = selected_source_ids.iter().collect::<HashSet<_>>();
     Ok(store
         .list_sources(0, 1_000_000)?
         .into_iter()
         .filter(|source| {
             source.kind == selected_source.kind
-                && source.source_group == selected_source.source_group
+                && match scope {
+                    ExportSourceScope::Current => false,
+                    ExportSourceScope::SourceGroup => {
+                        source.source_group == selected_source.source_group
+                    }
+                    ExportSourceScope::Selected => selected.contains(&source.id),
+                }
         })
         .collect())
 }

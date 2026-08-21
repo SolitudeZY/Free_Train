@@ -19,25 +19,37 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{
-    ProjectStore, StoredCandidateImage, StoredQualityAssessment, StoredReviewAsset,
-    StoredReviewAuditEvent, StoredRoiProfile, StoredSourceAsset, StoredVideoSelection,
+    ProjectStore, StoredCandidateImage, StoredPreparedImage, StoredQualityAssessment,
+    StoredReviewAsset, StoredReviewAuditEvent, StoredRoiProfile, StoredSourceAsset,
+    StoredVideoSelection,
 };
 use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod augmentation;
 mod export;
 mod operation_control;
+mod prepared;
 mod review;
 mod roi;
 mod sampling;
 mod video_preview;
 
+pub use augmentation::{
+    AugmentationPreview, AugmentationPreviewRequest, generate_augmentation_previews,
+    list_augmentation_recipes,
+};
 pub use export::{plan_export, run_export, run_export_with_control, run_export_with_progress};
 pub use operation_control::{OperationControl, OperationState};
+pub use prepared::{
+    PrepareImagesResult, prepare_review_images, prepare_review_images_with_control,
+};
 pub use review::{
-    list_review_workspace, list_review_workspace_at, redo_review_action, run_review_analysis,
-    run_review_analysis_at, undo_review_action, update_review_items,
+    list_review_workspace, list_review_workspace_at, list_review_workspace_at_for_sources,
+    redo_review_action, run_review_analysis, run_review_analysis_at,
+    run_review_analysis_at_for_sources_with_control, run_review_analysis_at_with_control,
+    undo_review_action, update_review_items,
 };
 pub use roi::{
     delete_roi_profile, list_effective_roi_profiles, preview_source_tiles, save_roi_profile,
@@ -316,8 +328,12 @@ impl Default for ReviewAnalysisConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ReviewItem {
     pub asset_key: String,
+    pub asset_kind: String,
     pub source_id: String,
     pub candidate_id: Option<String>,
+    pub roi_name: Option<String>,
+    pub tile_row: Option<u32>,
+    pub tile_column: Option<u32>,
     pub source_group: String,
     pub source_identifier: String,
     pub display_name: String,
@@ -435,6 +451,8 @@ pub struct ExportRequest {
     pub source_id: String,
     #[serde(default)]
     pub source_scope: ExportSourceScope,
+    #[serde(default)]
+    pub selected_source_ids: Vec<String>,
     pub candidate_id: Option<String>,
     pub output_dir: String,
     pub naming_template: String,
@@ -480,6 +498,7 @@ pub enum ExportSourceScope {
     #[default]
     Current,
     SourceGroup,
+    Selected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1285,7 +1304,7 @@ fn validate_project_name(name: &str) -> Result<(), ApplicationError> {
 }
 
 #[derive(Debug, Clone)]
-struct ProcessingInput {
+pub(crate) struct ProcessingInput {
     candidate_id: Option<String>,
     candidate: Option<StoredCandidateImage>,
     path: PathBuf,
@@ -1293,7 +1312,7 @@ struct ProcessingInput {
     height: u32,
 }
 
-fn resolve_one_input(
+pub(crate) fn resolve_one_input(
     store: &ProjectStore,
     source: &StoredSourceAsset,
     candidate_id: Option<&str>,
@@ -1330,7 +1349,7 @@ fn resolve_one_input(
     }
 }
 
-fn processing_input_from_candidate(
+pub(crate) fn processing_input_from_candidate(
     source: &StoredSourceAsset,
     candidate: StoredCandidateImage,
 ) -> Result<ProcessingInput, ApplicationError> {
@@ -1494,6 +1513,10 @@ pub enum ApplicationError {
     NoCandidateImages,
     #[error("当前项目没有可审核的在线图片或视频候选")]
     NoReviewAssets,
+    #[error("增强预览必须使用稳定的 ROI 切片资产")]
+    AugmentationInputNotPrepared,
+    #[error("该切片已被人工排除，不能用于增强预览")]
+    AugmentationInputExcluded,
     #[error("质量或相似分析参数无效")]
     InvalidReviewConfiguration,
     #[error("相似比较范围过大，请缩小到来源或来源组")]
@@ -1514,6 +1537,8 @@ pub enum ApplicationError {
     InvalidExportDirectory(PathBuf),
     #[error("导出目标已存在：{0}")]
     ExportConflict(PathBuf),
+    #[error("操作已取消")]
+    OperationCancelled,
 }
 
 #[cfg(test)]
@@ -1676,6 +1701,7 @@ mod project_tests {
             &ExportRequest {
                 source_id: sources[0].id.clone(),
                 source_scope: ExportSourceScope::SourceGroup,
+                selected_source_ids: Vec::new(),
                 candidate_id: None,
                 output_dir: path_text(&output),
                 naming_template: "{source}_{index}".to_owned(),
@@ -1692,6 +1718,7 @@ mod project_tests {
         let mut all_request = ExportRequest {
             source_id: sources[0].id.clone(),
             source_scope: ExportSourceScope::SourceGroup,
+            selected_source_ids: Vec::new(),
             candidate_id: None,
             output_dir: path_text(&root.join("export-all")),
             naming_template: "{source}_{index}".to_owned(),
@@ -1708,6 +1735,88 @@ mod project_tests {
         assert_eq!(plan_export(&session, &all_request).unwrap().items.len(), 1);
         assert_eq!(full_hash(&first_path).unwrap(), first_hash);
         assert_eq!(full_hash(&second_path).unwrap(), second_hash);
+
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn m4_review_algorithm_versions_are_explicitly_pinned() {
+        assert_eq!(QUALITY_ALGORITHM_VERSION, "quality-v1");
+        assert_eq!(SIMILARITY_ALGORITHM_VERSION, "similarity-v1");
+    }
+
+    #[test]
+    fn scoped_review_returns_only_selected_sources_and_preserves_other_manual_decisions() {
+        let root = test_root("m4-scoped-review");
+        let source_dir = root.join("camera-a");
+        fs::create_dir_all(&source_dir).unwrap();
+        ImageBuffer::from_pixel(48, 32, Rgb([30_u8, 60, 90]))
+            .save(source_dir.join("first.png"))
+            .unwrap();
+        ImageBuffer::from_pixel(48, 32, Rgb([90_u8, 60, 30]))
+            .save(source_dir.join("second.png"))
+            .unwrap();
+        let mut session = ProjectSession::create(&root, "m4-scoped-review-project").unwrap();
+        import_sources(
+            &mut session,
+            &[path_text(&source_dir)],
+            Path::new("ffprobe"),
+            Path::new("ffmpeg"),
+        )
+        .unwrap();
+        let sources = list_sources(&session, 0, 10).unwrap();
+        let config = ReviewAnalysisConfig {
+            min_width: 1,
+            min_height: 1,
+            min_sharpness: 0.0,
+            max_underexposed_ratio: 1.0,
+            max_overexposed_ratio: 1.0,
+            max_low_information: 1.0,
+            ..ReviewAnalysisConfig::default()
+        };
+        let full = run_review_analysis(&session, &config).unwrap();
+        let second_key = full
+            .items
+            .iter()
+            .find(|item| item.source_id == sources[1].id)
+            .unwrap()
+            .asset_key
+            .clone();
+        update_review_items(
+            &session,
+            std::slice::from_ref(&second_key),
+            ReviewAction::Exclude,
+        )
+        .unwrap();
+
+        let scoped = run_review_analysis_at_for_sources_with_control(
+            session.database_path(),
+            &config,
+            std::slice::from_ref(&sources[0].id),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(scoped.items.len(), 1);
+        assert_eq!(scoped.items[0].source_id, sources[0].id);
+        let store = ProjectStore::open(session.database_path()).unwrap();
+        assert!(
+            store
+                .list_quality_assessments()
+                .unwrap()
+                .iter()
+                .any(|quality| quality.source_id == sources[1].id)
+        );
+        assert_eq!(
+            store
+                .get_review_asset(&second_key)
+                .unwrap()
+                .unwrap()
+                .manual_decision
+                .as_deref(),
+            Some("exclude")
+        );
 
         drop(session);
         fs::remove_dir_all(root).unwrap();
@@ -1798,6 +1907,7 @@ mod project_tests {
         let request = ExportRequest {
             source_id: source.id.clone(),
             source_scope: ExportSourceScope::Current,
+            selected_source_ids: Vec::new(),
             candidate_id: None,
             output_dir: path_text(&output_dir),
             naming_template: "{source}_{roi}_r{row}_c{col}_{index}".to_owned(),
@@ -1812,6 +1922,17 @@ mod project_tests {
         for (planned, preview) in plan.items.iter().zip(&previews) {
             assert_eq!(planned.placement, preview.placement);
         }
+        let image_sources = list_sources(&session, 0, 10).unwrap();
+        let mut selected_request = request.clone();
+        selected_request.source_scope = ExportSourceScope::Selected;
+        selected_request.selected_source_ids = vec![image_sources[0].id.clone()];
+        assert_eq!(
+            plan_export(&session, &selected_request)
+                .unwrap()
+                .items
+                .len(),
+            4
+        );
         let mut excluded_request = request.clone();
         excluded_request.excluded_tiles.push(ExcludedTile {
             source_id: source.id.clone(),
@@ -1838,6 +1959,186 @@ mod project_tests {
         let manifest = fs::read_to_string(&result.manifest_path).unwrap();
         assert_eq!(manifest.lines().count(), 4);
         assert_eq!(full_hash(&source_path).unwrap(), source_hash_before);
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_tiles_are_stable_reused_and_compared_only_at_the_same_position() {
+        let root = test_root("m4-prepared");
+        let source_dir = root.join("camera-a");
+        fs::create_dir_all(&source_dir).unwrap();
+        for name in ["first.png", "second.png"] {
+            ImageBuffer::from_pixel(64, 48, Rgb([72_u8, 96, 120]))
+                .save(source_dir.join(name))
+                .unwrap();
+        }
+        let source_hashes =
+            ["first.png", "second.png"].map(|name| full_hash(&source_dir.join(name)).unwrap());
+        let mut session = ProjectSession::create(&root, "m4-prepared-project").unwrap();
+        import_sources(
+            &mut session,
+            &[path_text(&source_dir)],
+            Path::new("ffprobe"),
+            Path::new("ffmpeg"),
+        )
+        .unwrap();
+        let sources = list_sources(&session, 0, 10).unwrap();
+        let render_config = TileRenderConfig {
+            tile: TileConfig {
+                tile_width: 32,
+                tile_height: 24,
+                overlap_x: 0,
+                overlap_y: 0,
+                edge_strategy: EdgeStrategy::ShiftToEdge,
+            },
+            resize: ResizeMode::Stretch,
+            padding: PaddingMode::Constant,
+            fill: [0, 0, 0, 255],
+        };
+        let profile = save_roi_profile(
+            &session,
+            SaveRoiProfile {
+                id: None,
+                scope: RoiScope::SourceGroup,
+                scope_value: sources[0].source_group.clone(),
+                name: "track".to_owned(),
+                roi: Roi {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 48,
+                },
+                render_config,
+            },
+        )
+        .unwrap();
+
+        let first_prepare = prepare_review_images(&session, &[]).unwrap();
+        assert_eq!(first_prepare.prepared, 8);
+        assert_eq!(first_prepare.reused, 0);
+        let store = ProjectStore::open(session.database_path()).unwrap();
+        let first_records = store.list_prepared_images().unwrap();
+        let first_keys = first_records
+            .iter()
+            .map(|image| image.asset_key.clone())
+            .collect::<HashSet<_>>();
+        let first_paths = first_records
+            .iter()
+            .map(|image| PathBuf::from(&image.image_path))
+            .collect::<Vec<_>>();
+
+        let second_prepare = prepare_review_images(&session, &[]).unwrap();
+        assert_eq!(second_prepare.prepared, 0);
+        assert_eq!(second_prepare.reused, 8);
+        assert_eq!(
+            store
+                .list_prepared_images()
+                .unwrap()
+                .into_iter()
+                .map(|image| image.asset_key)
+                .collect::<HashSet<_>>(),
+            first_keys
+        );
+
+        let config = ReviewAnalysisConfig {
+            min_width: 1,
+            min_height: 1,
+            min_sharpness: 0.0,
+            max_underexposed_ratio: 1.0,
+            max_overexposed_ratio: 1.0,
+            max_low_information: 1.0,
+            similarity_scope: SimilarityScope::SourceGroup,
+            ..ReviewAnalysisConfig::default()
+        };
+        let workspace = run_review_analysis(&session, &config).unwrap();
+        assert_eq!(workspace.items.len(), 8);
+        assert!(
+            workspace
+                .items
+                .iter()
+                .all(|item| item.asset_kind == "prepared")
+        );
+        assert_eq!(workspace.summary.similarity_groups, 4);
+        for group_id in workspace
+            .items
+            .iter()
+            .filter_map(|item| item.similarity_group_id.as_deref())
+            .collect::<HashSet<_>>()
+        {
+            let members = workspace
+                .items
+                .iter()
+                .filter(|item| item.similarity_group_id.as_deref() == Some(group_id))
+                .collect::<Vec<_>>();
+            assert_eq!(members.len(), 2);
+            assert_eq!(members[0].roi_name, members[1].roi_name);
+            assert_eq!(members[0].tile_row, members[1].tile_row);
+            assert_eq!(members[0].tile_column, members[1].tile_column);
+        }
+        let old_key = workspace.items[0].asset_key.clone();
+        update_review_items(
+            &session,
+            std::slice::from_ref(&old_key),
+            ReviewAction::Exclude,
+        )
+        .unwrap();
+        let export_source = sources
+            .iter()
+            .find(|source| source.id == workspace.items[0].source_id)
+            .unwrap();
+        let eligible_plan = plan_export(
+            &session,
+            &ExportRequest {
+                source_id: export_source.id.clone(),
+                source_scope: ExportSourceScope::Current,
+                selected_source_ids: Vec::new(),
+                candidate_id: None,
+                output_dir: path_text(&root.join("reviewed-export")),
+                naming_template: "{source}_{roi}_r{row}_c{col}".to_owned(),
+                format: ExportFormat::Jpeg,
+                conflict_strategy: ConflictStrategy::AppendSequence,
+                content: ExportContent::Tiles,
+                review_scope: ExportReviewScope::Eligible,
+                excluded_tiles: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(eligible_plan.items.len(), 3);
+        assert_eq!(eligible_plan.skipped, 1);
+
+        save_roi_profile(
+            &session,
+            SaveRoiProfile {
+                id: Some(profile.id),
+                scope: RoiScope::SourceGroup,
+                scope_value: sources[0].source_group.clone(),
+                name: "track".to_owned(),
+                roi: Roi {
+                    x: 8,
+                    y: 0,
+                    width: 56,
+                    height: 48,
+                },
+                render_config,
+            },
+        )
+        .unwrap();
+        let changed = prepare_review_images(&session, &[]).unwrap();
+        assert!(changed.prepared > 0);
+        assert_eq!(changed.removed, 8);
+        assert!(store.get_review_asset(&old_key).unwrap().is_none());
+        assert!(first_paths.iter().all(|path| !path.exists()));
+        assert_eq!(
+            full_hash(&source_dir.join("first.png")).unwrap(),
+            source_hashes[0]
+        );
+        assert_eq!(
+            full_hash(&source_dir.join("second.png")).unwrap(),
+            source_hashes[1]
+        );
+
+        drop(store);
         drop(session);
         fs::remove_dir_all(root).unwrap();
     }

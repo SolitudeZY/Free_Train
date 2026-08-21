@@ -24,8 +24,20 @@ pub fn save_roi_profile(
         )?;
     }
     let now = Utc::now().to_rfc3339();
+    let existing_id = if draft.id.is_none() {
+        store
+            .list_roi_profiles(draft.scope.as_str(), scope_value)?
+            .into_iter()
+            .find(|profile| profile.name.eq_ignore_ascii_case(name))
+            .map(|profile| profile.id)
+    } else {
+        None
+    };
     let stored = StoredRoiProfile {
-        id: draft.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        id: draft
+            .id
+            .or(existing_id)
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
         scope_kind: draft.scope.as_str().to_owned(),
         scope_value: scope_value.to_owned(),
         name: name.to_owned(),
@@ -67,7 +79,19 @@ pub fn delete_roi_profile(
     session: &ProjectSession,
     profile_id: &str,
 ) -> Result<bool, ApplicationError> {
-    Ok(ProjectStore::open(session.database_path())?.delete_roi_profile(profile_id)?)
+    let store = ProjectStore::open(session.database_path())?;
+    let stale = store
+        .list_prepared_images()?
+        .into_iter()
+        .filter(|image| image.roi_profile_id == profile_id)
+        .collect::<Vec<_>>();
+    let augmentation_previews = store.list_augmentation_previews()?;
+    let deleted = store.delete_roi_profile(profile_id)?;
+    if deleted {
+        prepared::remove_prepared_cache(session, &stale);
+        prepared::remove_augmentation_cache(session, &augmentation_previews, &stale);
+    }
+    Ok(deleted)
 }
 
 pub fn preview_source_tiles(

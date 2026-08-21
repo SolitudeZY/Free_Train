@@ -281,7 +281,8 @@ project.ftproj/
 ├─ cache/
 │  ├─ thumbnails/
 │  ├─ decoded/
-│  ├─ tiles/
+│  ├─ prepared-images/<source-id>/
+│  ├─ tile-previews/
 │  └─ analysis/
 ├─ jobs/
 │  └─ <job-id>/
@@ -318,6 +319,24 @@ project.ftproj/
 - `schema_migrations`
 
 记录使用 UUID 或同等稳定标识，时间统一存储为 UTC，并在界面按本地时区显示。
+
+`prepared_images` 是 ROI/切片之后、审核与 M5 增强之前的稳定物化层。字段至少包括：
+
+- `asset_key`：稳定资产主键。
+- `source_id`、可选 `candidate_id`。
+- `roi_profile_id`、`roi_name`。
+- `tile_row`、`tile_column`。
+- `image_path`、`thumbnail_path`，且只能位于项目缓存根目录内。
+- 输出宽高、`parameter_fingerprint`、创建时间。
+
+同一输入和参数重复运行复用资产键与缓存；来源、ROI、渲染参数或切片位置变化会生成新键并清理旧质量/审核状态。正式审核和 M5 增强不得使用 `tile-previews` 的临时路径作为资产身份。
+
+M5 第一阶段将 Schema 升级到版本 7，并新增：
+
+- `augmentation_recipes`：保存版本化配方 JSON、Schema 版本和更新时间。
+- `augmentation_previews`：按 `prepared_images.asset_key` 保存变体序号、派生种子、`lineage_group_id`、执行器及版本、实际参数、缓存路径和内容 SHA-256。
+
+基础执行器版本为 `rust-basic-v1`，操作按配方数组顺序执行。预览与后续正式增强导出必须复用该执行器和种子派生路径；当前阶段预览仅写入项目缓存，不改变默认干净导出。
 
 ## 12. 错误模型
 
@@ -359,4 +378,3 @@ project.ftproj/
 - 语义多样性分析，但不得混入近重复去重结果。
 - 标注格式适配器和标注同步几何变换。
 - GPU 或硬件视频解码加速。
-
