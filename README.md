@@ -102,9 +102,9 @@ Free-Train 是一个面向计算机视觉数据准备的 **Windows 本地离线�
 
 ```mermaid
 flowchart LR
-    Video["视频素材"] --> Import
+    Video["视频素材"] --> Import["素材探测<br/>原地引用 / 指纹 / 离线重连"]
     Image["图片素材"] --> Import
-    Import["素材探测<br/>原地引用 / 指纹 / 离线重连"] --> Selection["抽帧计划<br/>人工选择 / 有效片段"]
+    Import --> Selection["抽帧计划<br/>人工选择 / 有效片段"]
     Selection --> Decode["帧解码 / 图片读取"]
     Decode --> Roi["ROI 与切片"]
     Roi --> Quality["质量分析"]
@@ -112,7 +112,7 @@ flowchart LR
     Similarity --> Review["人工审核"]
     Review --> ExportPlan["命名与导出计划"]
     ExportPlan --> Export["原子导出<br/>图片 + JSONL 追溯清单"]
-    ExportPlan -. "M5 进行中" .-> Augment["可选增强<br/>固定种子预览（未接入导出）"]
+    ExportPlan -.->|M5 进行中，尚未接入导出| Augment["可选增强<br/>固定种子预览"]
     Augment -.-> Export
 ```
 
